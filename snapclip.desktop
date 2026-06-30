@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=snapclip
+Comment=Region screenshot to clipboard (Wayland/GNOME), no flash
+Exec=snapclip
+Icon=applets-screenshooter
+Terminal=false
+StartupNotify=false
+Categories=Graphics;
+Keywords=screenshot;snip;clipboard;capture;region;
