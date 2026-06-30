@@ -28,6 +28,7 @@ Keys:  Enter = copy   •   S = save+copy   •   Esc = cancel
 """
 
 import argparse
+import fcntl
 import io
 import os
 import subprocess
@@ -55,6 +56,27 @@ CONFIG_DIR = os.path.join(
     GLib.get_user_config_dir() or os.path.expanduser("~/.config"), "snapclip"
 )
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+LOCK_PATH = os.path.join(
+    GLib.get_user_runtime_dir() or "/tmp", "snapclip.lock"
+)
+
+
+def acquire_single_instance_lock():
+    """Return an open, exclusively-flock'd file object, or None if another
+    snapclip is already running.
+
+    A screenshot overlay must be a singleton: pressing the hotkey again (or
+    triggering it twice) should NOT stack a second full-screen overlay. The
+    lock is held for the process lifetime and released automatically on exit
+    (even on crash, since flock is tied to the open file description).
+    """
+    try:
+        fp = open(LOCK_PATH, "w")
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None
+    return fp
 
 DEFAULT_CONFIG = {
     "border_color": "#00A3FF",      # selection outline colour
@@ -1398,6 +1420,16 @@ def main(argv=None):
 
     config = load_config()
 
+    # Single-instance for the interactive overlay: a second hotkey press must
+    # not stack another full-screen overlay. Hold the lock for the whole run.
+    # (self-test is a non-interactive debug mode and is exempt.)
+    lock = None
+    if not args.self_test:
+        lock = acquire_single_instance_lock()
+        if lock is None:
+            print("snapclip: a snapclip overlay is already open", file=sys.stderr)
+            return 0
+
     try:
         surface, full_desktop = capture_screen(allow_flash=args.allow_flash)
     except CaptureError as exc:
@@ -1407,6 +1439,8 @@ def main(argv=None):
     app = SnapClipApp(surface, config, self_test=args.self_test,
                       full_desktop=full_desktop)
     app.run([])
+    # `lock` stays referenced until here so the flock is held for the whole
+    # session; it releases automatically when the process exits.
 
     if args.self_test:
         r = app.test_result

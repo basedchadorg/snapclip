@@ -74,7 +74,7 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 wl-clipboard \
     gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
     gstreamer1.0-pipewire gstreamer1.0-plugins-base -y
 
-git clone https://github.com/YOUR_USERNAME/snapclip.git
+git clone https://github.com/gitoffmylibrary/snapclip.git
 cd snapclip
 ./install.sh        # symlinks ~/.local/bin/snapclip + an apps-menu entry (no root)
 ```
@@ -112,6 +112,7 @@ GNOME → **Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts �
 
 - **Name:** snapclip
 - **Command:** `snapclip` (after `./install.sh`) — or `python3 /full/path/to/snapclip.py`
+  (only one overlay opens at a time — pressing the key again while it's open is a no-op)
 - **Shortcut:** e.g. `Super+Shift+S` or `Ctrl+Alt+S`
 
 To put it on **PrintScreen**, first clear GNOME's built-in binding at

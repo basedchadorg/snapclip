@@ -163,6 +163,23 @@ print("normalize")
 check("negative width flips", sc.normalize([100, 100, -40, 60]) == [60, 100, 40, 60])
 check("negative height flips", sc.normalize([100, 100, 40, -60]) == [100, 40, 40, 60])
 
+print("single-instance lock (no stacked overlays)")
+_lock_orig = sc.LOCK_PATH
+sc.LOCK_PATH = os.path.join(tempfile.gettempdir(), "snapclip-test.lock")
+try:
+    fp1 = sc.acquire_single_instance_lock()
+    check("first instance gets the lock", fp1 is not None)
+    fp2 = sc.acquire_single_instance_lock()
+    check("second instance is blocked (would exit, not stack)", fp2 is None)
+    if fp1:
+        fp1.close()                       # first instance exits -> lock released
+    fp3 = sc.acquire_single_instance_lock()
+    check("lock is reacquirable after the first exits", fp3 is not None)
+    if fp3:
+        fp3.close()
+finally:
+    sc.LOCK_PATH = _lock_orig
+
 print("interaction geometry: double-click full-monitor toggle")
 LW, LH = 1920, 1080
 box = [100, 100, 400, 300]
