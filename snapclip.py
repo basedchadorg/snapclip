@@ -62,20 +62,35 @@ LOCK_PATH = os.path.join(
 )
 
 
-def acquire_single_instance_lock():
-    """Return an open, exclusively-flock'd file object, or None if another
-    snapclip is already running.
+ALREADY_RUNNING = object()   # sentinel: another instance holds the lock
 
-    A screenshot overlay must be a singleton: pressing the hotkey again (or
-    triggering it twice) should NOT stack a second full-screen overlay. The
-    lock is held for the process lifetime and released automatically on exit
-    (even on crash, since flock is tied to the open file description).
+
+def acquire_single_instance_lock():
+    """Try to become the single running snapclip instance.
+
+    Returns one of:
+      * an open file object  -> we hold the lock (keep it referenced),
+      * ALREADY_RUNNING      -> another overlay is open; the caller should exit,
+      * None                 -> the lock file could not even be created; proceed
+                                WITHOUT the guard rather than refuse to run.
+
+    A screenshot overlay must be a singleton (a second hotkey press must not
+    stack another full-screen overlay), but a missing/unwritable runtime dir
+    must NOT make the tool silently no-op — that's far worse than allowing a
+    rare stacked overlay. The lock releases automatically on exit (even on
+    crash, since flock is tied to the open file description).
     """
     try:
         fp = open(LOCK_PATH, "w")
+    except OSError as exc:
+        print(f"snapclip: could not create lock file ({exc}); "
+              f"continuing without the single-instance guard", file=sys.stderr)
+        return None
+    try:
         fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        return None
+        fp.close()
+        return ALREADY_RUNNING
     return fp
 
 DEFAULT_CONFIG = {
@@ -112,6 +127,10 @@ def _sanitize_config(cfg):
     or partially-written config can never crash capture or save."""
     for key in ("save_dir", "filename_format", "border_color", "handle_color"):
         if not isinstance(cfg.get(key), str) or not cfg[key]:
+            cfg[key] = DEFAULT_CONFIG[key]
+    # Colours must actually parse, else Gdk.RGBA.parse() leaves garbage.
+    for key in ("border_color", "handle_color"):
+        if not Gdk.RGBA().parse(cfg[key]):
             cfg[key] = DEFAULT_CONFIG[key]
     for key in ("border_width", "dim_opacity"):
         if not isinstance(cfg.get(key), (int, float)) or isinstance(cfg.get(key), bool):
@@ -374,9 +393,14 @@ def screencast_capture(timeout_s=10):
                 "org.gnome.Mutter.ScreenCast", session,
                 "org.gnome.Mutter.ScreenCast.Session", "Start",
                 None, None, Gio.DBusCallFlags.NONE, -1, None)
-            tid = GLib.timeout_add_seconds(timeout_s, lambda: (loop.quit(), False)[1])
+            def _timed_out():
+                state["timed_out"] = True
+                loop.quit()
+                return False
+            tid = GLib.timeout_add_seconds(timeout_s, _timed_out)
             loop.run()
-            GLib.source_remove(tid) if "node" in state else None
+            if not state.get("timed_out"):
+                GLib.source_remove(tid)
         except GLib.Error as exc:
             raise CaptureError(f"Mutter ScreenCast start failed: {exc}")
         finally:
@@ -560,12 +584,20 @@ def copy_png_to_clipboard(png_bytes):
 
 
 def save_png(png_bytes, save_dir, filename_format, when=None):
-    """Write PNG bytes to a timestamped file under `save_dir`. Returns path."""
+    """Write PNG bytes to a timestamped file under `save_dir`. Returns path.
+
+    `filename_format` may include subdirectories (e.g. '%Y/%m/shot-%H%M%S.png'),
+    which are created; but it can never escape `save_dir` — an absolute path or
+    '..' that would land outside falls back to the basename inside save_dir.
+    """
     when = when or datetime.now()
-    folder = os.path.expanduser(save_dir)
-    os.makedirs(folder, exist_ok=True)
+    folder = os.path.abspath(os.path.expanduser(save_dir))
     name = when.strftime(filename_format)
-    path = os.path.join(folder, name)
+    path = os.path.normpath(os.path.join(folder, name))
+    if path != folder and not path.startswith(folder + os.sep):
+        # escaped save_dir (absolute path / '..') -> keep just the file name
+        path = os.path.join(folder, os.path.basename(name) or "snapclip.png")
+    os.makedirs(os.path.dirname(path) or folder, exist_ok=True)
     # Avoid clobbering if two shots land in the same second.
     base, ext = os.path.splitext(path)
     n = 1
@@ -831,11 +863,13 @@ class OverlayWindow(Gtk.ApplicationWindow):
         last = self.config.get("last_selection")
         if self.config.get("remember_selection") and last and len(last) == 4:
             x, y, w, h = last
-            if w >= MIN_SIZE and h >= MIN_SIZE and \
-               0 <= x < self.logical_w and 0 <= y < self.logical_h:
-                # Clamp into bounds in case resolution changed.
-                w = min(w, self.logical_w - x)
-                h = min(h, self.logical_h - y)
+            # Pull a remembered box fully inside the current monitor (the screen
+            # may have shrunk); only use it if it still fits at >= MIN_SIZE.
+            x = max(0, min(int(x), self.logical_w - MIN_SIZE))
+            y = max(0, min(int(y), self.logical_h - MIN_SIZE))
+            w = min(int(w), self.logical_w - x)
+            h = min(int(h), self.logical_h - y)
+            if w >= MIN_SIZE and h >= MIN_SIZE:
                 return [x, y, w, h]
         w = int(self.logical_w * 0.4)
         h = int(self.logical_h * 0.4)
@@ -914,6 +948,9 @@ class OverlayWindow(Gtk.ApplicationWindow):
         cr.stroke()
 
         # 4. corner + edge handles
+        # Reset to the winding rule: the dim step above left EVEN_ODD set, which
+        # would punch holes where the handle squares overlap (tiny selections).
+        cr.set_fill_rule(cairo.FILL_RULE_WINDING)
         hc = Gdk.RGBA(); hc.parse(self.config.get("handle_color", "#FFFFFF"))
         cr.set_source_rgba(hc.red, hc.green, hc.blue, hc.alpha)
         for hx, hy in [
@@ -926,9 +963,19 @@ class OverlayWindow(Gtk.ApplicationWindow):
         cr.fill()
 
         # 5. live W x H readout near the top-left of the selection
+        pw, ph = self._readout_px()
+        self._draw_badge(cr, "%d × %d" % (pw, ph), x, y)
+
+    def _readout_px(self):
+        """Physical pixel size of the current selection — computed with the SAME
+        edges-then-difference math as the crop, so the readout never disagrees
+        with the produced PNG (notably under fractional scaling)."""
         sx, sy = self.scale
-        label = "%d × %d" % (int(round(w * sx)), int(round(h * sy)))
-        self._draw_badge(cr, label, x, y)
+        ox, oy = self.origin_px
+        x, y, w, h = self.selection
+        pw = max(1, int(round(ox + (x + w) * sx)) - int(round(ox + x * sx)))
+        ph = max(1, int(round(oy + (y + h) * sy)) - int(round(oy + y * sy)))
+        return pw, ph
 
     def _draw_badge(self, cr, text, x, y):
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
@@ -1001,7 +1048,10 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
     def _clamp_selection_soft(self):
         x, y, w, h = normalize(self.selection)
-        x = max(0, x); y = max(0, y)
+        # Pull the origin inside first, leaving room for at least MIN_SIZE, so
+        # enforcing the minimum below can't push the far edge past the monitor.
+        x = max(0, min(x, self.logical_w - MIN_SIZE))
+        y = max(0, min(y, self.logical_h - MIN_SIZE))
         w = max(MIN_SIZE, min(w, self.logical_w - x))
         h = max(MIN_SIZE, min(h, self.logical_h - y))
         self.selection = [x, y, w, h]
@@ -1051,9 +1101,8 @@ class OverlayWindow(Gtk.ApplicationWindow):
         return False
 
     def _size_text(self):
-        sx, sy = self.scale
-        _, _, w, h = self.selection
-        return "%d×%d" % (int(round(w * sx)), int(round(h * sy)))
+        pw, ph = self._readout_px()
+        return "%d×%d" % (pw, ph)
 
     # -- key handling --------------------------------------------------------
 
@@ -1113,6 +1162,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         except Exception as exc:
             self._fail(f"copy failed: {exc}")
             return
+        self.app.had_error = False      # a prior failed attempt is now resolved
         self._remember()
         self.app.quit()
 
@@ -1133,6 +1183,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         except Exception as exc:
             self._fail(f"saved to clipboard but writing the file failed: {exc}")
             return
+        self.app.had_error = False      # a prior failed attempt is now resolved
         self._remember()
         self.app.quit()
 
@@ -1357,18 +1408,27 @@ class SnapClipApp(Gtk.Application):
         self.had_error = False
 
     def do_activate(self):
-        provider = Gtk.CssProvider()
-        provider.load_from_string(CSS)
-        Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(), provider,
-            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-        )
-        win = OverlayWindow(self, self.surface, self.config,
-                            full_desktop=self.full_desktop)
-        if self.self_test:
-            self._run_self_test(win)
-            return
-        win.present()
+        # GTK swallows exceptions raised from an activate handler, which would
+        # otherwise leave the app exiting 0 with no window (silent no-op) or, in
+        # self-test, hang because quit() never runs. Guard the whole thing.
+        try:
+            provider = Gtk.CssProvider()
+            provider.load_from_string(CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(), provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+            win = OverlayWindow(self, self.surface, self.config,
+                                full_desktop=self.full_desktop)
+            if self.self_test:
+                self._run_self_test(win)
+                return
+            win.present()
+        except Exception as exc:
+            print(f"snapclip: failed to open the overlay: {exc}", file=sys.stderr)
+            self.had_error = True
+            self.test_result.setdefault("error", str(exc))
+            self.quit()
 
     def _run_self_test(self, win):
         # Use a deterministic selection covering the centre of the screen.
@@ -1378,11 +1438,10 @@ class SnapClipApp(Gtk.Application):
         h = int(win.logical_h * 0.5)
         win.selection = [x, y, w, h]
         png = win._png_bytes()
-        sx, sy = win.scale
         self.test_result = {
             "selection": win.selection,
             "scale": win.scale,
-            "expected_px": (int(round(w * sx)), int(round(h * sy))),
+            "expected_px": win._readout_px(),
             "png_len": len(png),
         }
         try:
@@ -1392,9 +1451,13 @@ class SnapClipApp(Gtk.Application):
             self.test_result["copied"] = False
             self.test_result["error"] = str(exc)
         if self.self_test == "save":
-            path = save_png(png, self.config.get("save_dir"),
-                            self.config.get("filename_format"))
-            self.test_result["saved"] = path
+            try:
+                self.test_result["saved"] = save_png(
+                    png, self.config.get("save_dir"),
+                    self.config.get("filename_format"))
+            except Exception as exc:
+                self.test_result["copied"] = False   # mark the run as failed
+                self.test_result["error"] = f"save failed: {exc}"
         self.quit()
 
 
@@ -1426,7 +1489,7 @@ def main(argv=None):
     lock = None
     if not args.self_test:
         lock = acquire_single_instance_lock()
-        if lock is None:
+        if lock is ALREADY_RUNNING:
             print("snapclip: a snapclip overlay is already open", file=sys.stderr)
             return 0
 

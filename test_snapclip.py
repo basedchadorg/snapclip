@@ -114,6 +114,17 @@ ab = png_size(sc.crop_to_png_bytes(big, [0, 0, 10, 10], (1.1, 1.0)))
 check("adjacent crop widths sum to combined width", a[0] + b[0] == ab[0],
       f"{a[0]}+{b[0]} vs {ab[0]}")
 
+# The live WxH readout must equal the actual produced crop size at every
+# position under fractional scaling (readout uses the same edges-then-diff math)
+fsurf = make_surface(2400, 1350)
+mismatch = 0
+for xpos in range(0, 120, 7):
+    actual = png_size(sc.crop_to_png_bytes(fsurf, [xpos, 10, 50, 40], (1.25, 1.25)))[0]
+    formula = max(1, int(round((xpos + 50) * 1.25)) - int(round(xpos * 1.25)))
+    mismatch += (actual != formula)
+check("crop width == readout formula at all positions (1.25x)", mismatch == 0,
+      f"{mismatch} mismatches")
+
 # ---------------------------------------------------------------------------
 print("crop clamps to bounds (selection partly off-screen)")
 surf3 = make_surface(800, 600)
@@ -168,15 +179,22 @@ _lock_orig = sc.LOCK_PATH
 sc.LOCK_PATH = os.path.join(tempfile.gettempdir(), "snapclip-test.lock")
 try:
     fp1 = sc.acquire_single_instance_lock()
-    check("first instance gets the lock", fp1 is not None)
+    check("first instance gets the lock (returns a file)", hasattr(fp1, "close"))
     fp2 = sc.acquire_single_instance_lock()
-    check("second instance is blocked (would exit, not stack)", fp2 is None)
-    if fp1:
+    check("second instance -> ALREADY_RUNNING (exit, not stack)",
+          fp2 is sc.ALREADY_RUNNING)
+    if hasattr(fp1, "close"):
         fp1.close()                       # first instance exits -> lock released
     fp3 = sc.acquire_single_instance_lock()
-    check("lock is reacquirable after the first exits", fp3 is not None)
-    if fp3:
+    check("lock is reacquirable after the first exits", hasattr(fp3, "close"))
+    if hasattr(fp3, "close"):
         fp3.close()
+    # unwritable/missing lock dir must NOT be read as 'already running' — it
+    # must return None so the tool still runs (lockless), never silently no-op.
+    sc.LOCK_PATH = "/nonexistent-dir-xyz/snapclip.lock"
+    res = sc.acquire_single_instance_lock()
+    check("uncreatable lock -> None (proceed lockless, not a silent no-op)",
+          res is None)
 finally:
     sc.LOCK_PATH = _lock_orig
 
@@ -227,6 +245,17 @@ with tempfile.TemporaryDirectory() as td:
           f"{p1} / {p2}")
     check("filename is timestamped", os.path.basename(p1) == "shot-2026.png",
           os.path.basename(p1))
+    # subdirectory formats are allowed and created
+    ps = sc.save_png(b"x", td, "%Y/sub/shot.png", when=when)
+    check("nested filename format creates subdirs",
+          os.path.exists(ps) and os.sep + "2026" + os.sep in ps, ps)
+    # absolute-path / parent-escape formats must stay inside save_dir
+    pe = sc.save_png(b"x", td, "/etc/evil.png", when=when)
+    check("absolute filename format cannot escape save_dir",
+          os.path.realpath(pe).startswith(os.path.realpath(td)), pe)
+    pd = sc.save_png(b"x", td, "../../escape.png", when=when)
+    check("parent-dir filename format cannot escape save_dir",
+          os.path.realpath(pd).startswith(os.path.realpath(td)), pd)
 
 # ---------------------------------------------------------------------------
 print("config load/save round-trip")
@@ -265,6 +294,14 @@ try:
         check("non-bool include_cursor coerced",
               cfg4["include_cursor"] is sc.DEFAULT_CONFIG["include_cursor"])
         check("malformed last_selection nulled", cfg4["last_selection"] is None)
+        # an unparseable colour string must fall back to the default
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"border_color": "blurple", "handle_color": "#zzz"}, fh)
+        cfg5 = sc.load_config()
+        check("invalid border_color coerced to default",
+              cfg5["border_color"] == sc.DEFAULT_CONFIG["border_color"])
+        check("invalid handle_color coerced to default",
+              cfg5["handle_color"] == sc.DEFAULT_CONFIG["handle_color"])
 finally:
     sc.CONFIG_PATH = orig
 
