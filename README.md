@@ -130,7 +130,8 @@ Stored in `~/.config/snapclip/config.json`:
 | Border width | `2` | px |
 | Outside dim | `0.35` | Darkening **outside** the selection; interior is always see-through. `0` = none |
 | Include mouse cursor | `off` | Best-effort: composites a pointer glyph inside the selection |
-| Remember last selection | `on` | Reopen with the previous box |
+| Remember last selection | `off` | On: reopen with your previous box. Off: a fresh centered box each time |
+| Default size (× screen) | `0.4` | Size of that fresh box as a fraction of the screen (used when not remembering) |
 | Save folder | `~/Pictures/Screenshots` | |
 | Filename format | `snapclip-%Y-%m-%d_%H-%M-%S.png` | `strftime` pattern |
 

@@ -99,8 +99,11 @@ DEFAULT_CONFIG = {
     "handle_color": "#FFFFFF",       # corner/edge handle colour
     "dim_opacity": 0.35,             # darkening applied OUTSIDE the selection
     "include_cursor": False,         # best-effort: composite a pointer glyph
-    "remember_selection": True,      # reopen with the last selection
+    "remember_selection": False,     # reopen with the last selection (off by
+                                     # default: most people want a fresh box)
     "last_selection": None,          # [x, y, w, h] in logical px
+    "default_size_pct": 0.4,         # fallback box = this fraction of the
+                                     # screen, centred (used when not remembering)
     "save_dir": "~/Pictures/Screenshots",
     "filename_format": "snapclip-%Y-%m-%d_%H-%M-%S.png",
 }
@@ -132,7 +135,7 @@ def _sanitize_config(cfg):
     for key in ("border_color", "handle_color"):
         if not Gdk.RGBA().parse(cfg[key]):
             cfg[key] = DEFAULT_CONFIG[key]
-    for key in ("border_width", "dim_opacity"):
+    for key in ("border_width", "dim_opacity", "default_size_pct"):
         if not isinstance(cfg.get(key), (int, float)) or isinstance(cfg.get(key), bool):
             cfg[key] = DEFAULT_CONFIG[key]
     for key in ("include_cursor", "remember_selection"):
@@ -871,8 +874,12 @@ class OverlayWindow(Gtk.ApplicationWindow):
             h = min(int(h), self.logical_h - y)
             if w >= MIN_SIZE and h >= MIN_SIZE:
                 return [x, y, w, h]
-        w = int(self.logical_w * 0.4)
-        h = int(self.logical_h * 0.4)
+        # Not remembering (or nothing usable remembered): a centred box sized to
+        # a configurable fraction of the screen.
+        pct = float(self.config.get("default_size_pct", 0.4) or 0.4)
+        pct = min(1.0, max(0.05, pct))
+        w = max(MIN_SIZE, int(self.logical_w * pct))
+        h = max(MIN_SIZE, int(self.logical_h * pct))
         return [(self.logical_w - w) // 2, (self.logical_h - h) // 2, w, h]
 
     def _build_toolbar(self):
@@ -1264,6 +1271,16 @@ class SettingsDialog(Gtk.Window):
         self.remember_sw.connect("notify::active", self._on_remember)
         add("Remember last selection", self.remember_sw)
 
+        # Default size (used when not remembering): fraction of the screen
+        self.size_scale = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 0.1, 1.0, 0.05)
+        self.size_scale.set_value(self.cfg["default_size_pct"])
+        self.size_scale.set_draw_value(True)
+        self.size_scale.set_tooltip_text(
+            "Size of the initial box when not remembering the last selection")
+        self.size_scale.connect("value-changed", self._on_default_size)
+        add("Default size (× screen)", self.size_scale)
+
         # Save folder
         folder_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.dir_entry = Gtk.Entry()
@@ -1319,6 +1336,10 @@ class SettingsDialog(Gtk.Window):
         self.cfg["remember_selection"] = sw.get_active()
         save_config(self.cfg)
 
+    def _on_default_size(self, scale):
+        self.cfg["default_size_pct"] = round(scale.get_value(), 3)
+        save_config(self.cfg)
+
     def _on_dir(self, entry):
         self.cfg["save_dir"] = entry.get_text()
         save_config(self.cfg)
@@ -1353,6 +1374,7 @@ class SettingsDialog(Gtk.Window):
         self.dim_scale.set_value(self.cfg["dim_opacity"])
         self.cursor_sw.set_active(self.cfg["include_cursor"])
         self.remember_sw.set_active(self.cfg["remember_selection"])
+        self.size_scale.set_value(self.cfg["default_size_pct"])
         self.dir_entry.set_text(self.cfg["save_dir"])
         self.fmt_entry.set_text(self.cfg["filename_format"])
         self._apply()

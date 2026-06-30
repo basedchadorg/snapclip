@@ -302,6 +302,19 @@ try:
               cfg5["border_color"] == sc.DEFAULT_CONFIG["border_color"])
         check("invalid handle_color coerced to default",
               cfg5["handle_color"] == sc.DEFAULT_CONFIG["handle_color"])
+        # remember-last-selection ships OFF by default
+        check("remember_selection defaults to off",
+              sc.DEFAULT_CONFIG["remember_selection"] is False)
+        # default_size_pct sanitized
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"default_size_pct": "big"}, fh)
+        cfg6 = sc.load_config()
+        check("non-numeric default_size_pct coerced",
+              cfg6["default_size_pct"] == sc.DEFAULT_CONFIG["default_size_pct"])
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"default_size_pct": 0.6}, fh)
+        check("valid default_size_pct persists",
+              sc.load_config()["default_size_pct"] == 0.6)
 finally:
     sc.CONFIG_PATH = orig
 
