@@ -61,6 +61,10 @@ the crop to the clipboard, and exits — with no flash at any point.
 - ✅ **No capture flash, no toolbar clutter, no leftover temp files.**
 - ✅ Correct under **fractional scaling** and **multi-monitor**.
 - ✅ Settings (border, dim, save folder, …) + a hotkey-friendly single command.
+- ✅ **Optional tools, all off by default** so the toolbar stays just
+  Copy / Save / Cancel: polygon & freehand selection (transparent outside the
+  shape), a pen and a text tool (each with its own colour) that bake into the
+  shot, and an "always save a copy" mode. Flip them on in ⚙ settings.
 
 ---
 
@@ -91,16 +95,43 @@ Run `snapclip` (after `install.sh`), from your apps menu, or via a hotkey.
 
 | Action | Key | Button |
 |---|---|---|
-| Copy region to clipboard, then quit | **Enter** | **Copy** |
+| Copy region to clipboard, then quit | **Enter** or **Ctrl+C** | **Copy** |
 | Save timestamped PNG **and** copy, then quit | **S** | **Save** |
-| Cancel — capture/save nothing, then quit | **Esc** | **Cancel** |
+| Nudge the box by 1 px (**Shift**: resize by 1 px) | **Arrow keys** | — |
+| Undo the last pen stroke / text | **Ctrl+Z** | — |
+| Leave the active tool mode; then cancel | **Esc** | **Cancel** |
 | Open settings | — | **⚙** |
 
-- **Move:** drag inside the box.
-- **Resize:** drag any edge or corner handle.
+- **Move:** drag inside the box (or arrow keys for 1 px steps).
+- **Resize:** drag any edge or corner handle (or Shift+arrows for 1 px steps).
 - **New selection:** drag on empty space to rubber-band a fresh box.
 - **Double-click:** snap to the whole monitor; double-click again to restore.
 - A live **W×H** readout (in real pixels) sits at the selection corner.
+
+### Optional tools (off by default)
+
+Enable any of these in ⚙ settings and a button for it appears on the toolbar
+(the default toolbar stays exactly Copy / Save / Cancel):
+
+- **Poly** — click the corners of a polygon; double-click or **Enter** closes
+  it. The copied/saved PNG is transparent outside the shape.
+- **Lasso** — drag a freehand loop around anything; same transparent result.
+- Once closed, a Poly/Lasso region **moves and resizes exactly like the
+  rectangle** — drag inside it, grab its handles, or use the arrow keys.
+  Dragging on empty space (or double-clicking) brings the rectangle back.
+- **Pen** — draw strokes on the frozen shot in your configured colour/width;
+  they're baked into the result at full resolution. **Ctrl+Z** undoes.
+- **Erase** — appears automatically whenever Pen is enabled: click or drag
+  over a stroke to remove it (**Ctrl+Z** brings it back). Erases pen strokes
+  only.
+- **Text** — click to type a label in your configured colour/size; **Enter**
+  places it, **Esc** discards it. Placed labels stay editable: **click one to
+  select it** (dashed grab box), **drag it** to move, **Delete** removes it —
+  and **Ctrl+Z** undoes any of that.
+
+The default colours ship as a **WCAG set** — selection border `#0077CC`, pen
+`#FFD60A`, text `#2D0A4E` have pairwise contrast ratios ≥ 3:1, so the three
+are distinguishable out of the box (and each is still fully customizable).
 
 Copy puts the crop on the clipboard as `image/png` and **never writes a file**.
 Save additionally writes `~/Pictures/Screenshots/snapclip-YYYY-MM-DD_HH-MM-SS.png`
@@ -124,16 +155,24 @@ To put it on **PrintScreen**, first clear GNOME's built-in binding at
 
 Stored in `~/.config/snapclip/config.json`:
 
+The dialog is grouped into **Selection**, **Output**, and **Tools**; changes
+apply live and are written once when the dialog closes.
+
 | Setting | Default | Notes |
 |---|---|---|
-| Border colour | `#00A3FF` | Selection outline colour |
+| Border colour | `#0077CC` | Selection outline colour (WCAG-distinct from pen/text defaults) |
 | Border width | `2` | px |
 | Outside dim | `0.35` | Darkening **outside** the selection; interior is always see-through. `0` = none |
-| Include mouse cursor | `off` | Best-effort: composites a pointer glyph inside the selection |
+| Default size (× screen) | `0.4` | Size of the fresh centered box (used when not remembering) |
 | Remember last selection | `off` | On: reopen with your previous box. Off: a fresh centered box each time |
-| Default size (× screen) | `0.4` | Size of that fresh box as a fraction of the screen (used when not remembering) |
-| Save folder | `~/Pictures/Screenshots` | |
-| Filename format | `snapclip-%Y-%m-%d_%H-%M-%S.png` | `strftime` pattern |
+| Save folder | `~/Pictures/Screenshots` | Click to edit in a popover, or Browse… |
+| Filename format | `snapclip-%Y-%m-%d_%H-%M-%S.png` | `strftime` pattern; click to edit in a popover |
+| Always save a copy | `off` | On: plain **Copy** (Enter) also writes the timestamped PNG |
+| Include mouse cursor | `off` | Best-effort: composites a pointer glyph inside the selection |
+| Polygon selection | `off` | Adds the **Poly** toolbar button |
+| Freehand selection | `off` | Adds the **Lasso** toolbar button |
+| Pen (+ colour, width) | `off`, `#FFD60A`, `3` | Adds the **Pen** button — and **Erase** rides along automatically |
+| Text (+ colour, size) | `off`, `#2D0A4E`, `18` | Adds the **Text** toolbar button |
 
 ---
 

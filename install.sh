@@ -9,7 +9,15 @@ APPS="$HOME/.local/share/applications"
 mkdir -p "$BIN" "$APPS"
 chmod +x "$DIR/snapclip.py"
 ln -sf "$DIR/snapclip.py" "$BIN/snapclip"
-install -Dm644 "$DIR/snapclip.desktop" "$APPS/snapclip.desktop"
+# Pin an absolute Exec path: GNOME launches .desktop entries with a PATH that
+# may not include ~/.local/bin, which makes a bare 'Exec=snapclip' fail silently.
+# The path is emitted via printf (not sed) and quoted per the desktop-entry
+# spec, so homes containing spaces or sed metacharacters ('&', '|') survive.
+{
+  grep -v '^Exec=' "$DIR/snapclip.desktop"
+  printf 'Exec="%s/snapclip"\n' "$BIN"
+} > "$APPS/snapclip.desktop"
+chmod 644 "$APPS/snapclip.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && \
     update-desktop-database "$APPS" >/dev/null 2>&1 || true
 

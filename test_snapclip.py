@@ -9,7 +9,6 @@ path/filename behaviour, config load/save, and file hygiene.
 Run:  python3 test_snapclip.py
 """
 
-import io
 import json
 import os
 import subprocess
@@ -74,6 +73,17 @@ def pixel(data, px, py):
     return tuple(pbytes[off:off + 3])
 
 
+def pixel_rgba(data, px, py):
+    """Like pixel() but includes alpha (255 for PNGs without an alpha channel)."""
+    loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+    loader.write(data); loader.close()
+    pb = loader.get_pixbuf()
+    pbytes = pb.get_pixels()
+    off = py * pb.get_rowstride() + px * pb.get_n_channels()
+    rgba = tuple(pbytes[off:off + pb.get_n_channels()])
+    return rgba if len(rgba) == 4 else rgba + (255,)
+
+
 # ---------------------------------------------------------------------------
 print("scale math")
 check("scale 1:1", sc.compute_scale(1920, 1080, 1920, 1080) == (1.0, 1.0))
@@ -81,6 +91,12 @@ sx, sy = sc.compute_scale(3840, 2160, 1920, 1080)
 check("scale 2x", sx == 2.0 and sy == 2.0)
 sx, sy = sc.compute_scale(2400, 1350, 1920, 1080)
 check("scale 1.25x", abs(sx - 1.25) < 1e-9 and abs(sy - 1.25) < 1e-9)
+
+# the shared crop/readout rect helper: edges rounded first, then differenced
+# 3*1.25=3.75->4, 7*1.25=8.75->9, 53*1.25=66.25->66, 47*1.25=58.75->59
+check("selection_to_physical rounds edges then differences",
+      sc.selection_to_physical([3, 7, 50, 40], (1.25, 1.25)) == (4, 9, 62, 50),
+      sc.selection_to_physical([3, 7, 50, 40], (1.25, 1.25)))
 
 # ---------------------------------------------------------------------------
 print("crop correctness (scale 1.0)")
@@ -132,6 +148,98 @@ data4 = sc.crop_to_png_bytes(surf3, [700, 500, 400, 400], (1.0, 1.0))
 w4, h4 = png_size(data4)
 check("clamped width", w4 == 100, w4)
 check("clamped height", h4 == 100, h4)
+
+# ---------------------------------------------------------------------------
+print("region transform (move/resize a freeform path via its bbox)")
+tri_path = [(10, 10), (30, 10), (10, 30)]
+moved = sc.transform_path(tri_path, sc.path_bbox(tri_path), [110, 60, 20, 20])
+check("translate keeps shape", moved == [(110, 60), (130, 60), (110, 80)], moved)
+scaled = sc.transform_path(tri_path, sc.path_bbox(tri_path), [10, 10, 40, 10])
+check("scale maps corners to the new bbox",
+      scaled == [(10, 10), (50, 10), (10, 20)], scaled)
+check("degenerate old bbox does not divide by zero",
+      sc.transform_path([(5, 5)], [5, 5, 0, 0], [1, 2, 3, 4]) == [(1, 2)])
+
+print("text label geometry (select/drag/delete hit-testing)")
+t1 = {"text": "Hi", "size": 18, "pos": (100, 50)}
+bb = sc.text_bbox(t1)
+check("text bbox has positive size", bb[2] > 0 and bb[3] > 0, bb)
+check("text bbox anchored at pos + entry padding",
+      bb[0] == 106 and bb[1] == 54, bb)
+check("longer text -> wider bbox",
+      sc.text_bbox({**t1, "text": "Hi there, much longer"})[2] > bb[2])
+check("bigger size -> taller bbox",
+      sc.text_bbox({**t1, "size": 36})[3] > bb[3])
+check("hit inside the label", sc.text_hit(t1, bb[0] + 2, bb[1] + 2))
+check("hit within grab padding", sc.text_hit(t1, bb[0] - 3, bb[1] - 3))
+check("miss far away", not sc.text_hit(t1, 400, 400))
+
+print("eraser stroke hit-testing")
+stk = {"width": 4.0, "points": [(0, 0), (100, 0)]}
+check("point on the segment hits", sc.stroke_hit(stk, 50, 0))
+check("point within width+slop hits", sc.stroke_hit(stk, 50, 7))
+check("point beyond slop misses", not sc.stroke_hit(stk, 50, 20))
+check("point past the endpoint misses", not sc.stroke_hit(stk, 130, 0))
+dot = {"width": 6.0, "points": [(40, 40)]}
+check("single-point stroke (dot) hits nearby", sc.stroke_hit(dot, 43, 42))
+
+print("default colours are a WCAG set (pairwise contrast >= 3:1)")
+def _lum(hexs):
+    r, g, b = (int(hexs[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    def lin(c):
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+def _contrast(a, b):
+    hi, lo = sorted((_lum(a), _lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+_dc = sc.DEFAULT_CONFIG
+for a, b in [("border_color", "pen_color"), ("border_color", "text_color"),
+             ("pen_color", "text_color")]:
+    check(f"{a} vs {b} >= 3:1",
+          _contrast(_dc[a], _dc[b]) >= 3.0,
+          f"{_contrast(_dc[a], _dc[b]):.2f}")
+
+# ---------------------------------------------------------------------------
+print("freeform region (polygon/lasso) mask")
+check("path_bbox", sc.path_bbox([(10, 20), (30, 5), (20, 40)]) == [10, 5, 20, 35],
+      sc.path_bbox([(10, 20), (30, 5), (20, 40)]))
+surfm = make_surface(100, 100)          # top-left quadrant (0-49,0-49) is red
+tri = [(0, 0), (48, 0), (0, 48)]        # triangle inside the red quadrant
+datam = sc.crop_to_png_bytes(surfm, sc.path_bbox(tri), (1.0, 1.0), mask_path=tri)
+check("inside the path keeps pixels (opaque red)",
+      pixel_rgba(datam, 4, 4) == (255, 0, 0, 255), pixel_rgba(datam, 4, 4))
+check("outside the path is fully transparent",
+      pixel_rgba(datam, 44, 44)[3] == 0, pixel_rgba(datam, 44, 44))
+_rect_loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+_rect_loader.write(sc.crop_to_png_bytes(surfm, [0, 0, 10, 10], (1.0, 1.0)))
+_rect_loader.close()
+check("plain rect crops stay alpha-free (RGB png)",
+      not _rect_loader.get_pixbuf().get_has_alpha())
+# self-intersecting mask: preview dims with EVEN_ODD, crop must match it —
+# a doubly-wound square is filled under WINDING but empty under EVEN_ODD
+loop2 = [(0, 0), (20, 0), (20, 20), (0, 20),
+         (0, 0), (20, 0), (20, 20), (0, 20)]
+check("self-intersecting mask uses even-odd like the preview",
+      pixel_rgba(sc.crop_to_png_bytes(surfm, [0, 0, 20, 20], (1.0, 1.0),
+                                      mask_path=loop2), 10, 10)[3] == 0,
+      pixel_rgba(sc.crop_to_png_bytes(surfm, [0, 0, 20, 20], (1.0, 1.0),
+                                      mask_path=loop2), 10, 10))
+
+print("annotations bake into the crop at physical resolution")
+def deco(cr):
+    cr.set_source_rgb(1, 0, 1)
+    cr.rectangle(10, 10, 10, 10)        # logical coords
+    cr.fill()
+surfd = make_surface(200, 200)          # 100x100 physical crop below, all red
+datad = sc.crop_to_png_bytes(surfd, [0, 0, 50, 50], (2.0, 2.0), decorate=deco)
+check("decorated pixel lands at logical*scale",
+      pixel(datad, 24, 24) == (255, 0, 255), pixel(datad, 24, 24))
+check("pixels outside the annotation untouched",
+      pixel(datad, 5, 5) == (255, 0, 0), pixel(datad, 5, 5))
+check("annotation is clipped by a mask when both are used",
+      pixel_rgba(sc.crop_to_png_bytes(surfd, sc.path_bbox(tri), (1.0, 1.0),
+                                      mask_path=tri, decorate=deco),
+                 44, 44)[3] == 0)
 
 # ---------------------------------------------------------------------------
 print("monitor origin offset")
@@ -315,6 +423,31 @@ try:
             json.dump({"default_size_pct": 0.6}, fh)
         check("valid default_size_pct persists",
               sc.load_config()["default_size_pct"] == 0.6)
+        # out-of-range numbers are clamped, not taken at face value
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"border_width": 99, "dim_opacity": 7,
+                       "default_size_pct": 0.001}, fh)
+        cfg7 = sc.load_config()
+        check("oversized border_width clamped", cfg7["border_width"] == 12,
+              cfg7["border_width"])
+        check("out-of-range dim_opacity clamped", cfg7["dim_opacity"] == 0.9,
+              cfg7["dim_opacity"])
+        check("tiny default_size_pct clamped",
+              cfg7["default_size_pct"] == 0.05, cfg7["default_size_pct"])
+        # optional tools + always-save ship OFF (clean default toolbar)
+        check("tools and always_save default off",
+              not any(sc.DEFAULT_CONFIG[k] for k in
+                      ("tool_polygon", "tool_lasso", "tool_pen", "tool_text",
+                       "always_save")))
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"pen_width": 99, "text_size": 1, "pen_color": "nope",
+                       "tool_pen": "yes"}, fh)
+        cfg8 = sc.load_config()
+        check("pen_width clamped", cfg8["pen_width"] == 16, cfg8["pen_width"])
+        check("text_size clamped", cfg8["text_size"] == 8, cfg8["text_size"])
+        check("bad pen_color coerced",
+              cfg8["pen_color"] == sc.DEFAULT_CONFIG["pen_color"])
+        check("non-bool tool flag coerced", cfg8["tool_pen"] is False)
 finally:
     sc.CONFIG_PATH = orig
 
@@ -322,8 +455,10 @@ finally:
 print("ScreenCast capture (flash-free, primary path)")
 pics_before = set(os.listdir(PICTURES)) if os.path.isdir(PICTURES) else set()
 try:
-    sc_surf = sc.screencast_capture()
+    sc_surf, sc_conn = sc.screencast_capture()
     check("screencast returned a surface", isinstance(sc_surf, cairo.ImageSurface))
+    check("screencast reports the captured connector",
+          isinstance(sc_conn, str) and bool(sc_conn), sc_conn)
     check("screencast surface has sane dimensions",
           sc_surf.get_width() > 0 and sc_surf.get_height() > 0,
           (sc_surf.get_width(), sc_surf.get_height()))
@@ -335,11 +470,13 @@ except sc.CaptureError as exc:
 
 print("capture_screen() prefers flash-free ScreenCast")
 try:
-    surf_cs, full_desktop = sc.capture_screen()
+    surf_cs, full_desktop, conn_cs = sc.capture_screen()
     check("capture_screen returns a surface",
           isinstance(surf_cs, cairo.ImageSurface))
     check("capture_screen used per-monitor ScreenCast (full_desktop is False)",
           full_desktop is False, f"full_desktop={full_desktop}")
+    check("capture_screen passes the connector through",
+          isinstance(conn_cs, str) and bool(conn_cs), conn_cs)
 except sc.CaptureError as exc:
     check("capture_screen", False, f"CaptureError: {exc}")
 
@@ -354,10 +491,12 @@ try:
     except sc.CaptureError:
         raised = True
     check("default capture_screen errors instead of flashing", raised)
-    surf_fb, full_fb = sc.capture_screen(allow_flash=True)   # opt-in -> portal
+    surf_fb, full_fb, conn_fb = sc.capture_screen(allow_flash=True)  # -> portal
     check("capture_screen(allow_flash=True) falls back to the portal",
           isinstance(surf_fb, cairo.ImageSurface) and full_fb is True,
           f"full_desktop={full_fb}")
+    check("portal fallback reports no connector (full-desktop capture)",
+          conn_fb is None, conn_fb)
 finally:
     sc.screencast_capture = _orig_sccap
 

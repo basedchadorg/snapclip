@@ -52,8 +52,8 @@ sx, sy, sw, sh = 360, 250, 540, 300        # selection
 cr.set_source_rgba(0,0,0,0.42); cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
 cr.rectangle(0,0,W,H); cr.rectangle(sx,sy,sw,sh); cr.fill()
 cr.set_fill_rule(cairo.FILL_RULE_WINDING)
-# border
-cr.set_source_rgb(0.0, 0.64, 1.0); cr.set_line_width(2)
+# border (matches the shipped default #0077CC)
+cr.set_source_rgb(0.0, 0.467, 0.8); cr.set_line_width(2)
 cr.rectangle(sx+0.5, sy+0.5, sw, sh); cr.stroke()
 # handles
 cr.set_source_rgb(1,1,1)
