@@ -1009,6 +1009,10 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self._drag_text = None          # (label, start pos) while dragging one
         self._mode_sync = False         # guards toggle-button feedback loops
 
+        # Device-resolution background cache, built lazily on the first draw
+        # (the widget must be realized first so its scale factor is known).
+        self._bg = None
+
         # Drawing surface.
         self.area = Gtk.DrawingArea()
         self.area.set_hexpand(True)
@@ -1099,6 +1103,29 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self._handle_rgba = hc
         self._border_width = float(self.config["border_width"])
         self._dim = float(self.config["dim_opacity"])
+
+    def _build_background(self):
+        """Render the frozen capture once into a device-resolution cache so
+        on_draw can blit it 1:1 instead of re-scaling the full physical frame
+        on every redraw.  Cached at the widget's device scale (logical * scale),
+        NOT at logical size: a logical-size cache is what softened the pre-1.2
+        HiDPI preview.  The shot never changes, so this runs exactly once, and
+        the per-frame cost drops from a filtered resample to a straight blit
+        (the win is largest under fractional scaling, where scale != capture)."""
+        scale = self.get_scale_factor() or 1
+        sx, sy = self.scale
+        ox, oy = self.origin_px
+        dw = max(1, int(round(self.logical_w * scale)))
+        dh = max(1, int(round(self.logical_h * scale)))
+        bg = cairo.ImageSurface(cairo.FORMAT_RGB24, dw, dh)
+        bg.set_device_scale(scale, scale)    # keep drawing in logical coords
+        cr = cairo.Context(bg)
+        cr.scale(1.0 / sx, 1.0 / sy)         # physical -> logical, baked in once
+        cr.set_source_surface(self.surface, -ox, -oy)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+        bg.flush()
+        return bg
 
     def _initial_selection(self):
         last = self.config.get("last_selection")
@@ -1382,18 +1409,15 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
     def on_draw(self, area, cr, width, height):
         x, y, w, h = self.selection
-        sx, sy = self.scale
-        ox, oy = self.origin_px
 
         # 1. frozen screen (interior shows real content => "see-through").
-        #    Painted straight from the physical-res capture: at scale 1 the
-        #    transform is identity (a plain blit), and on HiDPI the backing
-        #    store samples full-resolution pixels instead of a pre-shrunk copy.
-        cr.save()
-        cr.scale(1.0 / sx, 1.0 / sy)
-        cr.set_source_surface(self.surface, -ox, -oy)
+        #    Blitted 1:1 from a device-resolution cache built once on the first
+        #    draw, so a continuous drag / pen / lasso repaints without re-scaling
+        #    the full physical frame on every motion event.
+        if self._bg is None:
+            self._bg = self._build_background()
+        cr.set_source_surface(self._bg, 0, 0)
         cr.paint()
-        cr.restore()
 
         # 2. committed annotations (dimmed outside the selection, like the
         #    screen content they sit on)

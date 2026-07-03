@@ -252,6 +252,50 @@ check("origin_px offset picks right region (green)",
       pixel(data5, 5, 5) == (0, 255, 0), pixel(data5, 5, 5))
 
 # ---------------------------------------------------------------------------
+print("cached device-res background == per-frame render (no preview regression)")
+import types  # noqa: E402
+
+def _perframe_bg(surface, lw, lh, sx, gs):
+    """What on_draw did every frame before caching: scale the physical frame
+    straight into the device backing."""
+    dw, dh = round(lw * gs), round(lh * gs)
+    tgt = cairo.ImageSurface(cairo.FORMAT_RGB24, dw, dh)
+    tgt.set_device_scale(gs, gs)
+    cr = cairo.Context(tgt)
+    cr.scale(1.0 / sx, 1.0 / sx)
+    cr.set_source_surface(surface, 0, 0)
+    cr.get_source().set_filter(cairo.FILTER_GOOD)
+    cr.paint(); tgt.flush()
+    return tgt
+
+def _blit_bg(bg, lw, lh, gs):
+    """What on_draw does now: 1:1 blit the prebuilt device-res cache."""
+    dw, dh = round(lw * gs), round(lh * gs)
+    tgt = cairo.ImageSurface(cairo.FORMAT_RGB24, dw, dh)
+    tgt.set_device_scale(gs, gs)
+    cr = cairo.Context(tgt)
+    cr.set_source_surface(bg, 0, 0)
+    cr.paint(); tgt.flush()
+    return tgt
+
+for _sx, _gs in [(1.0, 1), (2.0, 2), (1.5, 2)]:   # standard, HiDPI, fractional
+    _lw, _lh = 160, 100
+    _phys = make_surface(round(_lw * _sx), round(_lh * _sx))
+    _stub = types.SimpleNamespace(
+        scale=(_sx, _sx), origin_px=(0, 0), logical_w=_lw, logical_h=_lh,
+        surface=_phys, get_scale_factor=lambda g=_gs: g)
+    _bg = sc.OverlayWindow._build_background(_stub)
+    check(f"background cached at device res (scale {_sx}, gs {_gs})",
+          (_bg.get_width(), _bg.get_height()) == (round(_lw * _gs), round(_lh * _gs)),
+          f"{_bg.get_width()}x{_bg.get_height()}")
+    _old = _perframe_bg(_phys, _lw, _lh, _sx, _gs).get_data()
+    _new = _blit_bg(_bg, _lw, _lh, _gs).get_data()
+    _diff = max((abs(a - b) for a, b in zip(_old, _new)), default=0) \
+        if len(_old) == len(_new) else 999
+    check(f"cached blit matches per-frame render (scale {_sx}, gs {_gs})",
+          _diff == 0, f"max pixel diff {_diff}")
+
+# ---------------------------------------------------------------------------
 print("interaction geometry: hit_zone")
 sel = [100, 100, 200, 150]   # x,y,w,h -> spans (100,100)-(300,250)
 check("center -> inside", sc.hit_zone(sel, 200, 175) == sc.Z_INSIDE)
