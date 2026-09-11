@@ -7,8 +7,10 @@ BIN="$HOME/.local/bin"
 APPS="$HOME/.local/share/applications"
 
 mkdir -p "$BIN" "$APPS"
-chmod +x "$DIR/snapclip.py"
-ln -sf "$DIR/snapclip.py" "$BIN/snapclip"
+chmod +x "$DIR/snapclip" "$DIR/snapclip.py"
+# Link the launcher (not snapclip.py itself): it imports the module so its
+# bytecode is cached, which trims every hotkey launch.
+ln -sf "$DIR/snapclip" "$BIN/snapclip"
 # Pin an absolute Exec path: GNOME launches .desktop entries with a PATH that
 # may not include ~/.local/bin, which makes a bare 'Exec=snapclip' fail silently.
 # The path is emitted via printf (not sed) and quoted per the desktop-entry

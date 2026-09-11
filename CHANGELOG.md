@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.3 — 2026-09-11
+
+### Added
+- **Quick-save on double-tap** (OFF by default): tap the snapclip hotkey
+  twice within `double_tap_ms` (300 ms, config-only, 120–800) to save and copy
+  the whole screen instantly with no overlay. While on, a single tap waits out
+  the tap window before the overlay appears; a cooldown collapses a mashed key
+  into one save. The two presses rendezvous through the single-instance lock
+  plus small timestamp files in the runtime dir.
+- Settings tooltips for every switch.
+
+### Performance
+- **Overlay rendering moved to the GPU.** The frozen capture is uploaded once
+  as a GSK texture and the selection box, dimming, handles and size readout
+  are render nodes, replacing a full-screen software blit + re-upload on every
+  motion event. Measured on a 1080p / 120 Hz desktop: 1.0 ms CPU per frame
+  during a drag (was 3.7 ms), with no dropped frames. Pen/text annotations
+  preview through a single cached cairo node bounded to the annotations, using
+  the very same drawing routine that bakes them into the shot.
+- **Capture overlaps GTK setup.** The ScreenCast grab runs on a worker thread
+  (private GLib main context) while the main thread builds and realizes the
+  still-invisible overlay window; the frame is handed over before the
+  ScreenCast session is torn down. Hotkey-to-first-frame: ~250 ms (was ~410).
+- **Copy/Save hide the overlay before doing any work**, so GNOME's close
+  animation starts the instant Enter is pressed while the crop, PNG encode and
+  `wl-copy` run underneath it (a failure brings the window straight back with
+  the error banner, as before). The process then exits immediately instead of
+  spending ~100 ms in GTK/interpreter teardown while still holding the
+  single-instance lock.
+- **GL renderer by default** (`GSK_RENDERER=gl` unless already set): GTK's
+  Vulkan renderer costs ~100 ms more at window realize for identical output.
+- Leaner launch: a `snapclip` launcher imports the module so its bytecode is
+  cached (~15 ms), `argparse` is only imported when there are arguments, and
+  `subprocess`/`datetime` load lazily at confirm time.
+
+### Fixed
+- The selection border's outline was handed to GTK through a temporary
+  `GskRoundedRect` that Python could free first (pixman "Invalid rectangle"
+  warnings and, occasionally, a frame without the border); it is now kept
+  alive for the call.
+
+### Changed
+- Requires GTK 4.14 or newer (GSK path fills/strokes and `B8G8R8X8` textures).
+- The test suite renders the GSK scene offscreen and compares it pixel-for-pixel
+  with the pre-1.3 cairo drawing; the portal-fallback tests report a SKIP
+  when the portal itself refuses the session instead of aborting the run.
+
 ## 1.2 — 2026-07-02
 
 ### Added — optional tools (all OFF by default; the stock toolbar stays Copy / Save / Cancel)

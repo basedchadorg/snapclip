@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""snapclip launcher.
+
+Imports snapclip.py as a module instead of running it as a script, so Python
+caches its bytecode in __pycache__ — running the 100 KB script directly
+recompiles it on every hotkey press (~15 ms).  `python3 snapclip.py` still
+works; this is just the fast door.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import snapclip  # noqa: E402
+
+snapclip.run()

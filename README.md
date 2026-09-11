@@ -80,10 +80,11 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-4.0 wl-clipboard \
 
 git clone https://github.com/gitoffmylibrary/snapclip.git
 cd snapclip
-./install.sh        # symlinks ~/.local/bin/snapclip + an apps-menu entry (no root)
+./install.sh        # symlinks ~/.local/bin/snapclip (the launcher) + an apps-menu entry (no root)
 ```
 
-`python3-gi-cairo` is required (GTK's Cairo drawing fails without it); the
+`python3-gi-cairo` is required (GTK's Cairo drawing fails without it) and the
+overlay needs **GTK 4.14 or newer** (it renders through GSK paths/textures); the
 GStreamer packages provide the flash-free capture. You can also run it in place
 without installing: `python3 snapclip.py`.
 
@@ -169,6 +170,7 @@ apply live and are written once when the dialog closes.
 | Filename format | `snapclip-%Y-%m-%d_%H-%M-%S.png` | `strftime` pattern; click to edit in a popover |
 | Always save a copy | `off` | On: plain **Copy** (Enter) also writes the timestamped PNG |
 | Include mouse cursor | `off` | Best-effort: composites a pointer glyph inside the selection |
+| Quick-save on double-tap | `off` | On: double-tap the hotkey to save + copy the whole screen with no overlay (a single tap waits ~300 ms first) |
 | Polygon selection | `off` | Adds the **Poly** toolbar button |
 | Freehand selection | `off` | Adds the **Lasso** toolbar button |
 | Pen (+ colour, width) | `off`, `#FFD60A`, `3` | Adds the **Pen** button — and **Erase** rides along automatically |
@@ -194,6 +196,29 @@ apply live and are written once when the dialog closes.
    over stdin; `wl-copy` daemonizes so the paste survives after snapclip exits.
 5. **Scaling.** The crop scales the logical selection by `capture_px / logical_px`,
    so it stays correct under fractional display scaling.
+
+### Performance notes
+
+Every launch is a fresh process (that is how a hotkey works), so the whole
+tool is built around latency:
+
+- **Capture and GTK setup overlap.** The ScreenCast grab runs on a worker
+  thread while the main thread builds and realizes the (still invisible)
+  overlay window — GL context, shaders, widgets. Nothing is mapped until the
+  frame exists, so the overlay never appears in its own shot.
+- **The overlay is rendered by the GPU.** The frozen frame is uploaded once as
+  a texture; the dimming, border, handles and readout are GSK render nodes.
+  Dragging the box costs ~1 ms of CPU per frame instead of a full-screen
+  software blit, so it stays smooth at 120 Hz and on 4K/HiDPI displays.
+- **Copy/Save hide the window first.** GNOME's close animation starts the
+  instant you press Enter; the crop, PNG encode and `wl-copy` happen
+  underneath it and the process exits without waiting for interpreter
+  teardown.
+- **GL renderer by default.** GTK's Vulkan renderer costs ~100 ms more per
+  launch here for identical output, so snapclip sets `GSK_RENDERER=gl` unless
+  you have set `GSK_RENDERER` yourself.
+- **`snapclip` (the launcher) imports `snapclip.py`** so Python caches its
+  bytecode; running the `.py` directly still works but recompiles it each time.
 
 ## Testing
 

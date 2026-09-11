@@ -2,51 +2,64 @@
 """
 snapclip — a minimal region-screenshot tool for Ubuntu / GNOME / Wayland.
 
-Architecture (why it works on GNOME 50 Wayland):
+Architecture (why it works on GNOME 50 Wayland, and why it is fast):
 
-  * Capturing the screen is done ONCE at launch through the XDG Desktop Portal
-    (org.freedesktop.portal.Screenshot).  On GNOME 50 the older
-    org.gnome.Shell.Screenshot D-Bus interface returns "AccessDenied", and
-    grim fails because Mutter has no wlr-screencopy — the portal is the only
-    supported path.
+  * The screen is captured ONCE at launch, flash-free, by grabbing a single
+    frame from Mutter's ScreenCast interface over PipeWire.  (On GNOME 50 the
+    older org.gnome.Shell.Screenshot D-Bus interface returns "AccessDenied",
+    grim fails because Mutter has no wlr-screencopy, and the screenshot portal
+    plays GNOME's shutter flash — it is only used with --allow-flash.)
 
-  * That full-screen capture is shown FROZEN inside a single full-screen,
-    undecorated GTK4 window.  The selection rectangle is drawn *as graphics*
-    inside that fixed surface (never an OS window that gets moved), which
-    sidesteps Wayland's "an app may not position its own window" restriction.
+  * The capture runs on a worker thread while the main thread builds and
+    realizes the GTK window (GL context, shaders, widgets).  Nothing is shown
+    until the frame is in hand, so the overlay never appears in its own shot,
+    but the two ~80 ms jobs overlap instead of running back to back.
 
-  * On confirm we crop the *cached* capture (taken before the overlay existed),
-    so the selection border can never appear in the result, and no second
-    capture / no flash is needed.
+  * That frame is shown FROZEN inside a single full-screen, undecorated GTK4
+    window.  The frame is uploaded to the GPU once as a texture; the selection
+    box, dimming, handles and readout are GSK render nodes, so a redraw during
+    a drag costs the GPU a handful of quads instead of the CPU a full-screen
+    software blit.  The selection is drawn *as graphics* inside that fixed
+    surface (never an OS window that gets moved), which sidesteps Wayland's
+    "an app may not position its own window" restriction.
 
-  * The crop is copied to the clipboard with `wl-copy --type image/png` fed
-    over stdin (no temp file is ever written for copy-only).  Save additionally
-    writes a timestamped PNG.  The portal's own full-screen dump is always
-    deleted so nothing is left behind.
+  * On confirm the window is hidden FIRST (GNOME starts its close animation
+    at once), then the *cached* capture is cropped, PNG-encoded and handed to
+    `wl-copy --type image/png` over stdin — no temp file, no second capture,
+    no flash, and the selection border can never appear in the result.  Save
+    additionally writes a timestamped PNG.
 
 Keys:  Enter / Ctrl+C = copy   •   S = save+copy   •   arrows = nudge
        (Shift+arrows = resize)   •   Ctrl+Z = undo annotation
        Esc = leave tool mode / cancel
 """
 
-import argparse
 import fcntl
 import io
 import itertools
 import json
 import os
-import shutil
-import subprocess
 import sys
-from datetime import datetime
+import threading
+import types
 
-import gi
+# GTK picks its Vulkan renderer on this class of system; its device and
+# pipeline setup costs ~100 ms more at window realize than the GL renderer, for
+# identical output (measured 158 ms vs 55 ms).  A screenshot tool lives for two
+# seconds, so startup wins.  (GL compiles its shaders on the very first run
+# after a driver/GTK update — Mesa's disk cache makes every later launch fast.)
+# An explicit GSK_RENDERER in the environment still takes precedence.
+os.environ.setdefault("GSK_RENDERER", "gl")
+
+import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Graphene", "1.0")
 gi.require_version("GLib", "2.0")
 gi.require_version("Gio", "2.0")
-from gi.repository import Gtk, Gdk, GLib, Gio, Pango  # noqa: E402
+from gi.repository import Gtk, Gdk, Gsk, Graphene, GLib, Gio, Pango  # noqa: E402
 
 import cairo  # noqa: E402  (needs python3-gi-cairo / pycairo)
 
@@ -116,6 +129,11 @@ DEFAULT_CONFIG = {
     "save_dir": "~/Pictures/Screenshots",
     "filename_format": "snapclip-%Y-%m-%d_%H-%M-%S.png",
     "always_save": False,            # Copy also writes the PNG file
+    # Double-tap the launch hotkey to save the whole screen instantly with no
+    # overlay. OFF by default. When on, a single tap waits double_tap_ms for a
+    # possible second tap before showing the overlay (so it can be suppressed).
+    "quick_save_double_tap": False,
+    "double_tap_ms": 300,            # second-tap window / arming delay (120-800)
     # Optional tools. ALL off by default — the stock toolbar stays exactly
     # Copy / Save / Cancel; enabling one adds its button.
     "tool_polygon": False,           # polygon selection (click corners)
@@ -155,7 +173,7 @@ def _sanitize_config(cfg):
         if not Gdk.RGBA().parse(cfg[key]):
             cfg[key] = DEFAULT_CONFIG[key]
     for key in ("border_width", "dim_opacity", "default_size_pct",
-                "pen_width", "text_size"):
+                "pen_width", "text_size", "double_tap_ms"):
         if not isinstance(cfg.get(key), (int, float)) or isinstance(cfg.get(key), bool):
             cfg[key] = DEFAULT_CONFIG[key]
     # Numbers must also be in range: a hand-edited border_width of 0 or a
@@ -165,7 +183,9 @@ def _sanitize_config(cfg):
     cfg["default_size_pct"] = min(1.0, max(0.05, cfg["default_size_pct"]))
     cfg["pen_width"] = min(16, max(1, cfg["pen_width"]))
     cfg["text_size"] = min(72, max(8, cfg["text_size"]))
+    cfg["double_tap_ms"] = int(min(800, max(120, cfg["double_tap_ms"])))
     for key in ("include_cursor", "remember_selection", "always_save",
+                "quick_save_double_tap",
                 "tool_polygon", "tool_lasso", "tool_pen", "tool_text"):
         if not isinstance(cfg.get(key), bool):
             cfg[key] = DEFAULT_CONFIG[key]
@@ -199,6 +219,37 @@ class CaptureError(RuntimeError):
 _portal_token_seq = itertools.count(1)   # unique handle_token per request
 
 
+class _SignalWait:
+    """Block the calling thread until a D-Bus signal handler calls quit() or
+    `timeout_s` elapses.  Runs on the thread-default GLib context, so the same
+    code works on the main thread (tests, --self-test) and on the capture
+    worker thread, which pushes a private context so nothing it does can touch
+    GTK's main loop."""
+
+    def __init__(self, timeout_s):
+        self._ctx = GLib.MainContext.get_thread_default()
+        self._loop = GLib.MainLoop.new(self._ctx, False)
+        self.timed_out = False
+        self._src = GLib.timeout_source_new_seconds(timeout_s)
+        self._src.set_callback(self._on_timeout)
+        self._src.attach(self._ctx)
+
+    def _on_timeout(self, *_args):
+        self.timed_out = True
+        self._loop.quit()
+        return GLib.SOURCE_REMOVE
+
+    def quit(self):
+        self._loop.quit()
+
+    def run(self):
+        """Returns True if quit() was called, False on timeout."""
+        self._loop.run()
+        if not self.timed_out:
+            self._src.destroy()
+        return not self.timed_out
+
+
 def portal_capture(timeout_s=30):
     """Capture the whole screen via the XDG Desktop Portal.
 
@@ -214,14 +265,14 @@ def portal_capture(timeout_s=30):
     token = "snapclip_%d_%d" % (os.getpid(), next(_portal_token_seq))
     request_path = f"/org/freedesktop/portal/desktop/request/{unique}/{token}"
 
-    loop = GLib.MainLoop()
+    wait = _SignalWait(timeout_s)
     state = {}
 
     def on_response(_c, _s, _o, _i, _sig, params):
         code, results = params.unpack()
         state["code"] = code
         state["results"] = results
-        loop.quit()
+        wait.quit()
 
     sub = bus.signal_subscribe(
         "org.freedesktop.portal.Desktop",
@@ -251,20 +302,11 @@ def portal_capture(timeout_s=30):
             )
         except GLib.Error as exc:
             raise CaptureError(f"screenshot portal call failed: {exc}")
-
-        def _timed_out():
-            state["timeout"] = True
-            loop.quit()
-            return False
-
-        tid = GLib.timeout_add_seconds(timeout_s, _timed_out)
-        loop.run()
-        if not state.get("timeout"):
-            GLib.source_remove(tid)
+        wait.run()
     finally:
         bus.signal_unsubscribe(sub)
 
-    if state.get("timeout"):
+    if wait.timed_out:
         # Cancel the outstanding request so the portal does not write its PNG
         # to disk after we have given up (would leave a file behind).
         try:
@@ -321,9 +363,10 @@ def _sample_to_surface(sample):
     """Convert a GStreamer BGRx sample into a cairo RGB24 surface.
 
     BGRx byte order equals cairo's RGB24 memory layout (little-endian), so no
-    pixel conversion is needed — just one copy out of the mapped buffer.
-    pycairo keeps `packed` alive for the surface's lifetime, so wrapping it is
-    safe and a further "owned" blit would be pure waste (~50 ms at 4K).
+    pixel conversion is needed.  PyGObject hands the mapped frame over as
+    `bytes` (one copy); cairo needs a writable buffer, so one more copy into a
+    bytearray is the minimum.  pycairo keeps that buffer alive for the
+    surface's lifetime, so wrapping it is safe.
     """
     from gi.repository import Gst
 
@@ -332,68 +375,84 @@ def _sample_to_surface(sample):
     if not w or not h:
         raise CaptureError("captured frame has no dimensions")
     buf = sample.get_buffer()
-
-    # Use the buffer's real row stride when the allocator reports one (rows can
-    # be padded to an alignment); only guess from the length as a last resort.
-    gstride = None
-    try:
-        gi.require_version("GstVideo", "1.0")
-        from gi.repository import GstVideo
-        vmeta = GstVideo.buffer_get_video_meta(buf)
-        if vmeta is not None and vmeta.stride:
-            gstride = vmeta.stride[0]
-    except Exception:
-        gstride = None
+    cstride = cairo.ImageSurface.format_stride_for_width(cairo.FORMAT_RGB24, w)
 
     ok, minfo = buf.map(Gst.MapFlags.READ)
     if not ok:
         raise CaptureError("could not map the captured frame")
     try:
-        mv = memoryview(minfo.data)
-        if not gstride:
-            gstride = len(mv) // h
-        cstride = cairo.ImageSurface.format_stride_for_width(
-            cairo.FORMAT_RGB24, w)
-        if gstride == cstride and len(mv) >= cstride * h:
-            packed = bytearray(mv[:cstride * h])      # the common case
-        else:                                         # padded rows: repack
-            row_bytes = min(gstride, cstride)
-            packed = bytearray(cstride * h)
-            for row in range(h):
-                packed[row * cstride:row * cstride + row_bytes] = \
-                    mv[row * gstride:row * gstride + row_bytes]
+        data = minfo.data
     finally:
         buf.unmap(minfo)
+
+    if len(data) == cstride * h:                  # the common, tightly packed case
+        packed = bytearray(data)
+    else:
+        # Rows are padded to an alignment: take the real stride from the video
+        # meta when the allocator reports one, else infer it from the length.
+        gstride = None
+        try:
+            gi.require_version("GstVideo", "1.0")
+            from gi.repository import GstVideo
+            vmeta = GstVideo.buffer_get_video_meta(buf)
+            if vmeta is not None and vmeta.stride:
+                gstride = vmeta.stride[0]
+        except Exception:
+            gstride = None
+        if not gstride:
+            gstride = len(data) // h
+        if gstride * h > len(data):
+            raise CaptureError("captured frame is truncated")
+        row_bytes = min(gstride, cstride)
+        mv = memoryview(data)
+        packed = bytearray(cstride * h)
+        for row in range(h):
+            packed[row * cstride:row * cstride + row_bytes] = \
+                mv[row * gstride:row * gstride + row_bytes]
 
     return cairo.ImageSurface.create_for_data(
         packed, cairo.FORMAT_RGB24, w, h, cstride)
 
 
-def screencast_capture(timeout_s=10):
+def texture_for_surface(surface):
+    """A Gdk.Texture of a cairo RGB24 capture, for the GPU-rendered overlay.
+
+    RGB24 memory is B8G8R8X8, which GTK uploads as-is (the X byte is ignored).
+    GLib.Bytes.new_take is the single-copy path in PyGObject (plain
+    GLib.Bytes.new copies twice, and a bytearray is marshalled byte by byte).
+    """
+    surface.flush()
+    data = GLib.Bytes.new_take(bytes(surface.get_data()))
+    return Gdk.MemoryTexture.new(
+        surface.get_width(), surface.get_height(),
+        Gdk.MemoryFormat.B8G8R8X8, data, surface.get_stride())
+
+
+def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
     """Grab one frame of the primary monitor via Mutter ScreenCast + PipeWire.
 
     Returns (surface, connector): a cairo.ImageSurface (physical pixels of that
     monitor) and the connector name that was captured (e.g. 'HDMI-1'), so the
-    overlay can be placed on the same monitor.  Unlike the screenshot portal
-    this does NOT play GNOME's shutter flash and shows no picker dialog.
+    overlay can be placed on the same monitor.  Two optional hooks let a caller
+    overlap its own work with the capture: `on_connector(name)` fires as soon
+    as the monitor is known (before the frame arrives), and `on_frame(surface)`
+    fires the moment the frame is converted — before the ~10 ms ScreenCast /
+    GStreamer teardown that precedes the return.
+    Unlike the screenshot portal this does NOT play GNOME's shutter flash and
+    shows no picker dialog.
     Raises CaptureError if ScreenCast/GStreamer is unavailable.
     """
-    try:
-        gi.require_version("Gst", "1.0")
-        from gi.repository import Gst
-    except (ValueError, ImportError) as exc:
-        raise CaptureError(f"GStreamer not available: {exc}")
-    if not Gst.is_initialized():
-        Gst.init(None)
-
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     except GLib.Error as exc:
         raise CaptureError(f"cannot reach the session bus: {exc}")
 
     connector = _primary_connector(bus)
+    if on_connector is not None:
+        on_connector(connector)
     session = None
     pipeline = None
+    Gst = None
     try:
         try:
             r = bus.call_sync(
@@ -415,11 +474,11 @@ def screencast_capture(timeout_s=10):
             raise CaptureError(f"Mutter ScreenCast setup failed: {exc}")
 
         state = {}
-        loop = GLib.MainLoop()
+        wait = _SignalWait(timeout_s)
 
         def on_added(_c, _s, _o, _i, _sig, params):
             state["node"] = params.unpack()[0]
-            loop.quit()
+            wait.quit()
 
         sub = bus.signal_subscribe(
             "org.gnome.Mutter.ScreenCast", "org.gnome.Mutter.ScreenCast.Stream",
@@ -429,14 +488,15 @@ def screencast_capture(timeout_s=10):
                 "org.gnome.Mutter.ScreenCast", session,
                 "org.gnome.Mutter.ScreenCast.Session", "Start",
                 None, None, Gio.DBusCallFlags.NONE, -1, None)
-            def _timed_out():
-                state["timed_out"] = True
-                loop.quit()
-                return False
-            tid = GLib.timeout_add_seconds(timeout_s, _timed_out)
-            loop.run()
-            if not state.get("timed_out"):
-                GLib.source_remove(tid)
+            # Load GStreamer while Mutter brings the PipeWire stream up.
+            try:
+                gi.require_version("Gst", "1.0")
+                from gi.repository import Gst
+            except (ValueError, ImportError) as exc:
+                raise CaptureError(f"GStreamer not available: {exc}")
+            if not Gst.is_initialized():
+                Gst.init(None)
+            wait.run()
         except GLib.Error as exc:
             raise CaptureError(f"Mutter ScreenCast start failed: {exc}")
         finally:
@@ -464,7 +524,10 @@ def screencast_capture(timeout_s=10):
             sample = sink.emit("try-pull-sample", Gst.SECOND * timeout_s)
             if sample is None:
                 raise CaptureError("ScreenCast delivered no frame")
-            return _sample_to_surface(sample), connector
+            surface = _sample_to_surface(sample)
+            if on_frame is not None:
+                on_frame(surface)
+            return surface, connector
         except CaptureError:
             raise
         except Exception as exc:   # GLib.Error (missing plugin) and anything else
@@ -484,7 +547,7 @@ def screencast_capture(timeout_s=10):
                 pass
 
 
-def capture_screen(allow_flash=False):
+def capture_screen(allow_flash=False, on_connector=None, on_frame=None):
     """Capture the primary monitor, flash-free.
 
     Uses Mutter ScreenCast, which does not flash.  If that is unavailable we
@@ -496,10 +559,25 @@ def capture_screen(allow_flash=False):
     Returns (surface, full_desktop, connector).  full_desktop is False for the
     per-monitor ScreenCast capture and True only for the opt-in portal path;
     connector is the captured monitor's connector name (None for the portal,
-    whose capture spans every monitor).
+    whose capture spans every monitor).  `on_connector(name)` is forwarded to
+    screencast_capture (never called on the portal path); `on_frame(surface,
+    full_desktop, connector)` receives the same values as the return, as early
+    as they exist (on the ScreenCast path: before its teardown).
     """
+    seen = {}
+
+    def _connector(name):
+        seen["connector"] = name
+        if on_connector is not None:
+            on_connector(name)
+
+    def _frame(surface):
+        if on_frame is not None:
+            on_frame(surface, False, seen.get("connector"))
+
     try:
-        surface, connector = screencast_capture()
+        surface, connector = screencast_capture(on_connector=_connector,
+                                                on_frame=_frame)
         return surface, False, connector
     except CaptureError as exc:
         if not allow_flash:
@@ -512,7 +590,10 @@ def capture_screen(allow_flash=False):
                 "instead (it triggers GNOME's screenshot flash).")
         print("snapclip: --allow-flash set; using the screenshot portal, which "
               "flashes", file=sys.stderr)
-        return portal_capture(), True, None
+        surface = portal_capture()
+        if on_frame is not None:
+            on_frame(surface, True, None)
+        return surface, True, None
 
 
 def compute_scale(surface_w, surface_h, logical_w, logical_h):
@@ -565,18 +646,34 @@ def transform_path(points, old_bbox, new_bbox):
     return [(nx + (px - ox) * fx, ny + (py - oy) * fy) for px, py in points]
 
 
+_text_metrics_cache = {}
+
+
+def _text_metrics(text, size):
+    """(ascent, descent, x_advance, ink width) of a label, memoized: hit
+    testing calls this per label per motion event."""
+    key = (text, size)
+    m = _text_metrics_cache.get(key)
+    if m is None:
+        surf = cairo.ImageSurface(cairo.FORMAT_A8, 1, 1)
+        cr = cairo.Context(surf)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(size)
+        ascent, descent = cr.font_extents()[:2]
+        ext = cr.text_extents(text)
+        m = (ascent, descent, ext.x_advance, ext.width)
+        _text_metrics_cache[key] = m
+    return m
+
+
 def text_bbox(tnote):
     """Logical bounding box [x, y, w, h] of a committed text annotation,
-    matching where _draw_annotations paints it (entry padding + baseline)."""
-    surf = cairo.ImageSurface(cairo.FORMAT_A8, 1, 1)
-    cr = cairo.Context(surf)
-    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
-                        cairo.FONT_WEIGHT_BOLD)
-    cr.set_font_size(tnote["size"])
-    ascent, descent = cr.font_extents()[:2]
-    ext = cr.text_extents(tnote["text"])
+    matching where draw_annotations paints it (entry padding + baseline)."""
+    ascent, descent, x_advance, width = _text_metrics(tnote["text"],
+                                                      tnote["size"])
     x, y = tnote["pos"]
-    return [x + 6, y + 4, max(ext.x_advance, ext.width), ascent + descent]
+    return [x + 6, y + 4, max(x_advance, width), ascent + descent]
 
 
 def text_hit(tnote, x, y, pad=4.0):
@@ -603,6 +700,63 @@ def stroke_hit(stroke, x, y, slop=6.0):
         if (cx - x) ** 2 + (cy - y) ** 2 <= r2:
             return True
     return False
+
+
+def draw_stroke(cr, rgba, width, pts):
+    cr.set_source_rgba(*rgba)
+    cr.set_line_width(width)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(*pts[0])
+    for p in pts[1:] or [pts[0]]:       # single click = a round dot
+        cr.line_to(*p)
+    cr.stroke()
+
+
+def draw_annotations(cr, strokes, texts):
+    """Draw committed strokes/texts in LOGICAL coordinates with cairo.  The
+    SAME code paints the live preview (inside a cairo render node) and bakes
+    the annotations into the crop, so what you see is exactly what you get."""
+    for s in strokes:
+        draw_stroke(cr, s["rgba"], s["width"], s["points"])
+    for t in texts:
+        cr.set_source_rgba(*t["rgba"])
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                            cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(t["size"])
+        ascent = cr.font_extents()[0]
+        tx, ty = t["pos"]
+        # ~the floating entry's own text position (padding + baseline)
+        cr.move_to(tx + 6, ty + ascent + 4)
+        cr.show_text(t["text"])
+
+
+def annotation_bounds(strokes, texts, logical_w, logical_h):
+    """Logical rect (x, y, w, h) that contains every committed annotation
+    (round caps and glyph overhang included), clipped to the monitor, or None
+    when there is nothing to draw.  It bounds the cairo node that previews
+    them, so that node re-rasterizes an annotation-sized area, not the screen."""
+    x0 = y0 = float("inf")
+    x1 = y1 = float("-inf")
+    for s in strokes:
+        r = s["width"] / 2.0 + 2.0
+        for px, py in s["points"]:
+            x0 = min(x0, px - r)
+            y0 = min(y0, py - r)
+            x1 = max(x1, px + r)
+            y1 = max(y1, py + r)
+    for t in texts:
+        bx, by, bw, bh = text_bbox(t)
+        pad = t["size"] * 0.5 + 8.0
+        x0 = min(x0, bx - pad)
+        y0 = min(y0, by - pad)
+        x1 = max(x1, bx + bw + pad)
+        y1 = max(y1, by + bh + pad)
+    x0, y0 = max(0.0, x0), max(0.0, y0)
+    x1, y1 = min(float(logical_w), x1), min(float(logical_h), y1)
+    if not (x1 > x0 and y1 > y0):
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
 
 
 def crop_to_png_bytes(surface, sel, scale, origin_px=(0, 0), cursor=None,
@@ -702,6 +856,7 @@ def copy_png_to_clipboard(png_bytes):
     those fds, so a captured pipe would never reach EOF and `.wait()` would
     hang forever.  We rely on the parent's exit code instead.
     """
+    import subprocess          # only needed at confirm time; keep launch lean
     try:
         proc = subprocess.Popen(
             ["wl-copy", "--type", "image/png"],
@@ -730,7 +885,9 @@ def save_png(png_bytes, save_dir, filename_format, when=None):
     which are created; but it can never escape `save_dir` — an absolute path or
     '..' that would land outside falls back to the basename inside save_dir.
     """
-    when = when or datetime.now()
+    if when is None:
+        from datetime import datetime
+        when = datetime.now()
     folder = os.path.abspath(os.path.expanduser(save_dir))
     name = when.strftime(filename_format)
     path = os.path.normpath(os.path.join(folder, name))
@@ -852,6 +1009,246 @@ def toggle_full_selection(selection, prev, logical_w, logical_h):
     return full, new_prev
 
 
+def dim_rects(sel, width, height):
+    """The four rects that cover everything OUTSIDE `sel` within (0, 0, width,
+    height): top and bottom bands full-width, left and right strips between
+    them.  They tile the outside exactly (no overlap, no gap), which is what
+    the old even-odd fill produced — but as plain GPU quads."""
+    x, y, w, h = sel
+    left, top = max(0.0, x), max(0.0, y)
+    right, bottom = min(float(width), x + w), min(float(height), y + h)
+    if right <= left or bottom <= top:              # nothing visible: dim all
+        return [(0.0, 0.0, float(width), float(height))]
+    rects = []
+    if top > 0:
+        rects.append((0.0, 0.0, float(width), top))
+    if bottom < height:
+        rects.append((0.0, bottom, float(width), height - bottom))
+    if left > 0:
+        rects.append((0.0, top, left, bottom - top))
+    if right < width:
+        rects.append((right, top, width - right, bottom - top))
+    return rects
+
+
+# ----------------------------------------------------------------------------
+# Overlay rendering — GSK render nodes (GPU), one cairo node for annotations
+# ----------------------------------------------------------------------------
+
+_BADGE_FONT = Pango.FontDescription.from_string("Sans 13px")
+_BADGE_BG = Gdk.RGBA(red=0, green=0, blue=0, alpha=0.65)
+_BADGE_FG = Gdk.RGBA(red=1, green=1, blue=1, alpha=1)
+_BADGE_PAD = 5
+
+
+def _rect(x, y, w, h):
+    return Graphene.Rect().init(x, y, w, h)
+
+
+def _stroke(width, dash=None):
+    s = Gsk.Stroke.new(width)
+    if dash:
+        s.set_dash(dash)
+    return s
+
+
+def _path_of(points, close, extra=None):
+    pb = Gsk.PathBuilder.new()
+    pb.move_to(*points[0])
+    for p in points[1:]:
+        pb.line_to(*p)
+    if extra is not None:
+        pb.line_to(*extra)
+    if close:
+        pb.close()
+    return pb.to_path()
+
+
+def _rect_path(x, y, w, h):
+    pb = Gsk.PathBuilder.new()
+    pb.add_rect(_rect(x, y, w, h))
+    return pb.to_path()
+
+
+def _region_paths(st, width, height):
+    """(outline, outline + full-screen rect) Gsk paths for the committed
+    freeform region, cached on the region's identity (a drag replaces the
+    point list, so identity is a complete change key)."""
+    pts = st.region_path
+    cache = st._region_cache
+    if cache is not None and cache[0] is pts and cache[1] == (width, height):
+        return cache[2], cache[3]
+    outline = _path_of(pts, close=True)
+    pb = Gsk.PathBuilder.new()
+    pb.add_rect(_rect(0, 0, width, height))
+    pb.move_to(*pts[0])
+    for p in pts[1:]:
+        pb.line_to(*p)
+    pb.close()
+    dim = pb.to_path()
+    st._region_cache = (pts, (width, height), outline, dim)
+    return outline, dim
+
+
+def _annotation_node(st, width, height):
+    """Committed pen strokes / text labels as ONE cairo render node covering
+    just their bounding box.  Rebuilt only when an annotation is added, moved,
+    erased or restored, so dragging the selection over them costs nothing."""
+    key = (tuple(id(s) for s in st.strokes),
+           tuple((id(t), t["pos"], t["text"], t["size"]) for t in st.texts),
+           width, height)
+    cache = st._annot_cache
+    if cache is not None and cache[0] == key:
+        return cache[1]
+    node = None
+    bounds = annotation_bounds(st.strokes, st.texts, width, height)
+    if bounds is not None:
+        snap = Gtk.Snapshot.new()
+        cr = snap.append_cairo(_rect(*bounds))
+        draw_annotations(cr, st.strokes, st.texts)
+        node = snap.to_node()
+    st._annot_cache = (key, node)
+    return node
+
+
+def _pending_pen_node(st, width, height):
+    """The stroke being drawn right now, in its final look (same cairo code
+    that will bake it), bounded to the stroke's own bbox."""
+    pts = st._pending_points
+    rgba, w = st._pending_pen
+    r = w / 2.0 + 2.0
+    x0 = max(0.0, min(p[0] for p in pts) - r)
+    y0 = max(0.0, min(p[1] for p in pts) - r)
+    x1 = min(float(width), max(p[0] for p in pts) + r)
+    y1 = min(float(height), max(p[1] for p in pts) + r)
+    if not (x1 > x0 and y1 > y0):
+        return None
+    snap = Gtk.Snapshot.new()
+    cr = snap.append_cairo(_rect(x0, y0, x1 - x0, y1 - y0))
+    draw_stroke(cr, rgba, w, pts)
+    return snap.to_node()
+
+
+def _draw_text(snapshot, layout, x, y, rgba):
+    snapshot.save()
+    snapshot.translate(Graphene.Point().init(x, y))
+    snapshot.append_layout(layout, rgba)
+    snapshot.restore()
+
+
+def render_overlay(snapshot, st, width, height):
+    """Build the overlay scene for one frame.
+
+    `st` is the overlay state (the OverlayWindow, or a stub in tests): the
+    frozen capture as `texture`, geometry (`scale`, `origin_px`, `logical_w/h`),
+    the selection, region/annotation/tool state, and the cached style colours.
+    Everything is appended as GSK nodes — a texture, colour quads, a border,
+    path fills/strokes and a text layout — so GTK composites it on the GPU;
+    only annotation previews go through cairo (see _annotation_node).
+    """
+    x, y, w, h = st.selection
+    lw, lh = st.logical_w, st.logical_h
+
+    # 1. frozen screen (interior shows real content => "see-through").  The
+    #    physical-resolution capture is mapped onto the logical monitor rect;
+    #    at 1:1 device mapping the GPU samples it exactly, at any other scale
+    #    trilinear filtering keeps it smooth.
+    tex = st.texture
+    if tex is not None:
+        sx, sy = st.scale
+        ox, oy = st.origin_px
+        snapshot.append_scaled_texture(
+            tex, Gsk.ScalingFilter.TRILINEAR,
+            _rect(-ox / sx, -oy / sy, tex.get_width() / sx, tex.get_height() / sy))
+
+    # 2. committed annotations (dimmed outside the selection, like the
+    #    screen content they sit on)
+    if st.strokes or st.texts:
+        node = _annotation_node(st, lw, lh)
+        if node is not None:
+            snapshot.append_node(node)
+
+    # 3. dim everything OUTSIDE the selection/region (interior untouched)
+    region = st.region_path
+    outline = None
+    if region:
+        outline, dim_path = _region_paths(st, width, height)
+    if st._dim > 0:
+        if region:
+            snapshot.append_fill(dim_path, Gsk.FillRule.EVEN_ODD, st._dim_rgba)
+        else:
+            for r in dim_rects(st.selection, width, height):
+                snapshot.append_color(st._dim_rgba, _rect(*r))
+
+    # 4. border along the region path / selection rect.  A stroke of width bw
+    #    centred on rect(x+.5, y+.5, w, h) == a border node whose outline sits
+    #    bw/2 outside that rect.
+    bw = st._border_width
+    bc = st._border_rgba
+    if region:
+        snapshot.append_stroke(outline, _stroke(bw), bc)
+    else:
+        # GskRoundedRect is a plain C struct (no GType): init_from_rect() must
+        # be called on a Python object that stays alive until append_border
+        # has copied it — chaining Gsk.RoundedRect().init_from_rect(...) hands
+        # GTK a pointer into an already-freed temporary.
+        outline_rect = Gsk.RoundedRect()
+        outline_rect.init_from_rect(
+            _rect(x + 0.5 - bw / 2, y + 0.5 - bw / 2, w + bw, h + bw), 0)
+        snapshot.append_border(outline_rect, [bw, bw, bw, bw], [bc, bc, bc, bc])
+
+    # 5. corner + edge handles — regions resize via their bbox, so they
+    #    get the same handles (plus a faint dashed bbox to anchor them)
+    if region and st.mode == "select":
+        snapshot.append_stroke(_rect_path(x + 0.5, y + 0.5, w, h),
+                               _stroke(1.0, [4.0, 4.0]), st._border_faint_rgba)
+    if st.mode == "select":
+        hc = st._handle_rgba
+        for hx, hy in [
+            (x, y), (x + w, y), (x, y + h), (x + w, y + h),
+            (x + w / 2, y), (x + w / 2, y + h),
+            (x, y + h / 2), (x + w, y + h / 2),
+        ]:
+            snapshot.append_color(hc, _rect(hx - HANDLE_DRAW, hy - HANDLE_DRAW,
+                                            HANDLE_DRAW * 2, HANDLE_DRAW * 2))
+
+    # 6. in-progress tool previews (drawn undimmed, on top)
+    pts = st._pending_points
+    if pts:
+        if st.mode == "pen":            # live stroke in its final look
+            node = _pending_pen_node(st, lw, lh)
+            if node is not None:
+                snapshot.append_node(node)
+        else:                           # polygon / lasso outline in progress
+            rubber = st.pointer if st.mode == "polygon" else None
+            if len(pts) >= 2 or rubber is not None:
+                snapshot.append_stroke(_path_of(pts, close=False, extra=rubber),
+                                       _stroke(max(1.0, bw)), bc)
+            if st.mode == "polygon":    # vertex dots
+                hc = st._handle_rgba
+                for p in pts:
+                    snapshot.append_color(hc, _rect(p[0] - 3, p[1] - 3, 6, 6))
+
+    # 7. selected text label (text mode): dashed grab box around it
+    if st.mode == "text" and st.selected_text is not None:
+        bx, by, bw_, bh_ = text_bbox(st.selected_text)
+        snapshot.append_stroke(_rect_path(bx - 4.5, by - 4.5, bw_ + 9, bh_ + 9),
+                               _stroke(1.0, [4.0, 3.0]), st._handle_strong_rgba)
+
+    # 8. live W x H readout near the top-left of the selection
+    pw, ph = st._readout_px()
+    layout = st.pango_layout("%d × %d" % (pw, ph))
+    ink = layout.get_pixel_extents()[0]
+    pad = _BADGE_PAD
+    bw_, bh_ = ink.width + pad * 2, ink.height + pad * 2
+    by = y - bh_ - 4
+    if by < 0:                       # not enough room above -> put inside
+        by = y + 4
+    bx = max(0, min(x, lw - bw_))
+    snapshot.append_color(_BADGE_BG, _rect(bx, by, bw_, bh_))
+    _draw_text(snapshot, layout, bx + pad - ink.x, by + pad - ink.y, _BADGE_FG)
+
+
 # ----------------------------------------------------------------------------
 # Tool icons — drawn with cairo so they exist on every icon theme and follow
 # the button's CSS colour (hover/checked states included).
@@ -941,45 +1338,55 @@ def tool_icon_widget(kind):
 # ----------------------------------------------------------------------------
 
 
+class _Canvas(Gtk.Widget):
+    """The full-screen drawing surface: a bare widget whose snapshot is the
+    GSK scene built by render_overlay (no cairo backing surface, no per-frame
+    software blit or texture re-upload — the frozen frame lives on the GPU)."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+
+    def do_measure(self, orientation, _for_size):
+        # A full-monitor minimum/natural size guarantees the window measures
+        # to the monitor even before the fullscreen configure arrives.
+        size = self.win.logical_w if orientation == Gtk.Orientation.HORIZONTAL \
+            else self.win.logical_h
+        return size, size, -1, -1
+
+    def do_snapshot(self, snapshot):
+        render_overlay(snapshot, self.win, self.get_width(), self.get_height())
+
+
 class OverlayWindow(Gtk.ApplicationWindow):
-    def __init__(self, app, surface, config, full_desktop=False, connector=None):
+    def __init__(self, app, config, monitor):
         super().__init__(application=app)
         self.app = app
-        self.surface = surface          # physical-res capture (for cropping)
         self.config = config
+        self.surface = None             # physical-res capture (for cropping)
+        self.texture = None             # the same frame, for the GPU preview
 
         self.set_decorated(False)
         self.add_css_class("snapclip-overlay")
 
-        display = Gdk.Display.get_default()
-        monitors = display.get_monitors()
-        monitor = self._pick_monitor(display, connector)
+        # The window is built (and realized) BEFORE the capture lands, on the
+        # monitor Mutter reported as primary; set_capture() finalises scale and
+        # origin once the frame is known and re-targets the monitor if the
+        # capture turned out to cover a different one.
+        self.monitor = monitor
         geo = monitor.get_geometry()
         self.logical_w, self.logical_h = geo.width, geo.height
-        # scale (physical px per logical px) and origin_px (this monitor's
-        # top-left within the capture, in PHYSICAL pixels).
-        if not full_desktop or monitors.get_n_items() <= 1:
-            # ScreenCast (per-monitor) OR single-monitor portal: the surface is
-            # exactly this screen, so capture/logical is the exact scale and the
-            # origin is (0, 0).  This also handles any fractional scaling.
-            self.scale = compute_scale(
-                surface.get_width(), surface.get_height(),
-                self.logical_w, self.logical_h,
-            )
-            self.origin_px = (0, 0)
-        else:
-            # Portal fallback on multi-monitor: the capture spans every screen,
-            # so use THIS monitor's own scale and physical origin.
-            mscale = self._monitor_scale(monitor)
-            self.scale = (mscale, mscale)
-            self.origin_px = (int(round(geo.x * mscale)),
-                              int(round(geo.y * mscale)))
+        self.scale = (1.0, 1.0)
+        self.origin_px = (0, 0)
         # Request the full monitor size up front.  Do NOT mark the window
         # non-resizable: on Wayland that makes GTK reject the compositor's
         # fullscreen configure and the window collapses to its 200x200 minimum.
         self.set_default_size(self.logical_w, self.logical_h)
 
-        # Parse configured colours/sizes once — on_draw runs per frame.
+        # Parse configured colours/sizes once — rendering runs per frame.
         self.refresh_style()
 
         # Initial selection.
@@ -1000,6 +1407,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.mode = "select"            # select | polygon | lasso | pen | text
         self.region_path = None         # committed freeform region (logical pts)
         self._pending_points = []       # in-progress polygon/lasso/pen points
+        self._pending_pen = None        # (rgba, width) of the stroke being drawn
         self.strokes = []               # committed pen strokes
         self.texts = []                 # committed text annotations
         self._undo = []                 # annotation kinds, in commit order
@@ -1009,19 +1417,14 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self._drag_text = None          # (label, start pos) while dragging one
         self._mode_sync = False         # guards toggle-button feedback loops
 
-        # Device-resolution background cache, built lazily on the first draw
-        # (the widget must be realized first so its scale factor is known).
-        self._bg = None
+        # Render caches (see _region_paths / _annotation_node).
+        self._region_cache = None
+        self._annot_cache = None
+        self._layout_cache = (None, None)
+        self._first_paint_id = None     # one-shot toolbar re-place after map
 
         # Drawing surface.
-        self.area = Gtk.DrawingArea()
-        self.area.set_hexpand(True)
-        self.area.set_vexpand(True)
-        # Explicit content size guarantees a full-monitor natural size even
-        # before the fullscreen configure arrives.
-        self.area.set_content_width(self.logical_w)
-        self.area.set_content_height(self.logical_h)
-        self.area.set_draw_func(self.on_draw)
+        self.area = _Canvas(self)
 
         self.overlay = Gtk.Overlay()
         self.overlay.set_child(self.area)
@@ -1062,12 +1465,13 @@ class OverlayWindow(Gtk.ApplicationWindow):
         keys.connect("key-pressed", self.on_key)
         self.add_controller(keys)
 
-        self.connect("realize", lambda *_: self.fullscreen_on_monitor(monitor))
+        self.connect("realize", lambda *_: self.fullscreen_on_monitor(self.monitor))
         GLib.idle_add(self._reposition_toolbar)
 
     # -- setup helpers -------------------------------------------------------
 
-    def _pick_monitor(self, display, connector):
+    @staticmethod
+    def pick_monitor(display, connector):
         """The Gdk monitor whose connector matches the captured one, else 0.
 
         (GTK4 removed Gdk.Monitor.is_primary; matching the connector Mutter
@@ -1094,38 +1498,76 @@ class OverlayWindow(Gtk.ApplicationWindow):
         except Exception:
             return 1.0
 
+    def retarget(self, monitor):
+        """Move the (still unmapped) window to `monitor` if it is not already
+        there: the window is built on the first monitor before Mutter reports
+        which one is primary / which one the capture covers."""
+        if monitor.get_connector() == self.monitor.get_connector():
+            return
+        self.monitor = monitor
+        geo = monitor.get_geometry()
+        self.logical_w, self.logical_h = geo.width, geo.height
+        self.set_default_size(self.logical_w, self.logical_h)
+        self.area.queue_resize()
+        self.selection = self._initial_selection()
+        self._prev_selection = None
+        self.pointer = (self.logical_w / 2, self.logical_h / 2)
+        self.fullscreen_on_monitor(monitor)
+        self._reposition_toolbar()
+
+    def set_capture(self, surface, texture, full_desktop=False, connector=None):
+        """Attach the captured frame: fix the monitor, derive scale/origin."""
+        display = self.get_display()
+        monitors = display.get_monitors()
+        monitor = self.pick_monitor(display, connector)
+        self.retarget(monitor)
+        geo = monitor.get_geometry()
+        # scale (physical px per logical px) and origin_px (this monitor's
+        # top-left within the capture, in PHYSICAL pixels).
+        if not full_desktop or monitors.get_n_items() <= 1:
+            # ScreenCast (per-monitor) OR single-monitor portal: the surface is
+            # exactly this screen, so capture/logical is the exact scale and the
+            # origin is (0, 0).  This also handles any fractional scaling.
+            self.scale = compute_scale(
+                surface.get_width(), surface.get_height(),
+                self.logical_w, self.logical_h,
+            )
+            self.origin_px = (0, 0)
+        else:
+            # Portal fallback on multi-monitor: the capture spans every screen,
+            # so use THIS monitor's own scale and physical origin.
+            mscale = self._monitor_scale(monitor)
+            self.scale = (mscale, mscale)
+            self.origin_px = (int(round(geo.x * mscale)),
+                              int(round(geo.y * mscale)))
+        self.surface = surface
+        self.texture = texture
+        self.area.queue_draw()
+        self._reposition_toolbar()      # the readout depends on the scale
+
     def refresh_style(self):
-        """Cache the parsed config values on_draw needs; config is sanitized,
+        """Cache the parsed config values rendering needs; config is sanitized,
         so per-frame re-parsing of colour strings would be pure overhead."""
         bc = Gdk.RGBA(); bc.parse(self.config["border_color"])
         hc = Gdk.RGBA(); hc.parse(self.config["handle_color"])
         self._border_rgba = bc
         self._handle_rgba = hc
+        self._border_faint_rgba = Gdk.RGBA(red=bc.red, green=bc.green,
+                                           blue=bc.blue, alpha=0.55)
+        self._handle_strong_rgba = Gdk.RGBA(red=hc.red, green=hc.green,
+                                            blue=hc.blue, alpha=0.9)
         self._border_width = float(self.config["border_width"])
         self._dim = float(self.config["dim_opacity"])
+        self._dim_rgba = Gdk.RGBA(red=0, green=0, blue=0, alpha=self._dim)
 
-    def _build_background(self):
-        """Render the frozen capture once into a device-resolution cache so
-        on_draw can blit it 1:1 instead of re-scaling the full physical frame
-        on every redraw.  Cached at the widget's device scale (logical * scale),
-        NOT at logical size: a logical-size cache is what softened the pre-1.2
-        HiDPI preview.  The shot never changes, so this runs exactly once, and
-        the per-frame cost drops from a filtered resample to a straight blit
-        (the win is largest under fractional scaling, where scale != capture)."""
-        scale = self.get_scale_factor() or 1
-        sx, sy = self.scale
-        ox, oy = self.origin_px
-        dw = max(1, int(round(self.logical_w * scale)))
-        dh = max(1, int(round(self.logical_h * scale)))
-        bg = cairo.ImageSurface(cairo.FORMAT_RGB24, dw, dh)
-        bg.set_device_scale(scale, scale)    # keep drawing in logical coords
-        cr = cairo.Context(bg)
-        cr.scale(1.0 / sx, 1.0 / sy)         # physical -> logical, baked in once
-        cr.set_source_surface(self.surface, -ox, -oy)
-        cr.get_source().set_filter(cairo.FILTER_GOOD)
-        cr.paint()
-        bg.flush()
-        return bg
+    def pango_layout(self, text):
+        """The badge layout for `text`, reused while the readout is unchanged."""
+        cached_text, layout = self._layout_cache
+        if cached_text != text:
+            layout = self.area.create_pango_layout(text)
+            layout.set_font_description(_BADGE_FONT)
+            self._layout_cache = (text, layout)
+        return layout
 
     def _initial_selection(self):
         last = self.config.get("last_selection")
@@ -1378,168 +1820,16 @@ class OverlayWindow(Gtk.ApplicationWindow):
             self._undo.append(("text", tnote))
         self.area.queue_draw()
 
-    @staticmethod
-    def _draw_stroke(cr, rgba, width, pts):
-        cr.set_source_rgba(*rgba)
-        cr.set_line_width(width)
-        cr.set_line_cap(cairo.LINE_CAP_ROUND)
-        cr.set_line_join(cairo.LINE_JOIN_ROUND)
-        cr.move_to(*pts[0])
-        for p in pts[1:] or [pts[0]]:       # single click = a round dot
-            cr.line_to(*p)
-        cr.stroke()
-
     def _draw_annotations(self, cr):
-        """Draw committed strokes/texts in LOGICAL coordinates.  Used both for
-        the live preview (on_draw) and to bake into the crop (decorate)."""
-        for s in self.strokes:
-            self._draw_stroke(cr, s["rgba"], s["width"], s["points"])
-        for t in self.texts:
-            cr.set_source_rgba(*t["rgba"])
-            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
-                                cairo.FONT_WEIGHT_BOLD)
-            cr.set_font_size(t["size"])
-            ascent = cr.font_extents()[0]
-            tx, ty = t["pos"]
-            # ~the floating entry's own text position (padding + baseline)
-            cr.move_to(tx + 6, ty + ascent + 4)
-            cr.show_text(t["text"])
-
-    # -- drawing -------------------------------------------------------------
-
-    def on_draw(self, area, cr, width, height):
-        x, y, w, h = self.selection
-
-        # 1. frozen screen (interior shows real content => "see-through").
-        #    Blitted 1:1 from a device-resolution cache built once on the first
-        #    draw, so a continuous drag / pen / lasso repaints without re-scaling
-        #    the full physical frame on every motion event.
-        if self._bg is None:
-            self._bg = self._build_background()
-        cr.set_source_surface(self._bg, 0, 0)
-        cr.paint()
-
-        # 2. committed annotations (dimmed outside the selection, like the
-        #    screen content they sit on)
-        if self.strokes or self.texts:
-            self._draw_annotations(cr)
-
-        # 3. dim everything OUTSIDE the selection/region (interior untouched)
-        bc = self._border_rgba
-        if self._dim > 0:
-            cr.set_source_rgba(0, 0, 0, self._dim)
-            cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
-            cr.rectangle(0, 0, width, height)
-            self._region_or_rect_path(cr, x, y, w, h)
-            cr.fill()
-
-        # 4. border along the region path / selection rect
-        cr.set_line_width(self._border_width)
-        cr.set_source_rgba(bc.red, bc.green, bc.blue, bc.alpha)
-        if self.region_path:
-            self._region_or_rect_path(cr, x, y, w, h)
-        else:
-            cr.rectangle(x + 0.5, y + 0.5, w, h)
-        cr.stroke()
-
-        # 5. corner + edge handles — regions resize via their bbox, so they
-        #    get the same handles (plus a faint dashed bbox to anchor them)
-        # Reset to the winding rule: the dim step above left EVEN_ODD set, which
-        # would punch holes where the handle squares overlap (tiny selections).
-        cr.set_fill_rule(cairo.FILL_RULE_WINDING)
-        if self.region_path and self.mode == "select":
-            cr.set_source_rgba(bc.red, bc.green, bc.blue, 0.55)
-            cr.set_line_width(1.0)
-            cr.set_dash([4, 4])
-            cr.rectangle(x + 0.5, y + 0.5, w, h)
-            cr.stroke()
-            cr.set_dash([])
-        if self.mode == "select":
-            hc = self._handle_rgba
-            cr.set_source_rgba(hc.red, hc.green, hc.blue, hc.alpha)
-            for hx, hy in [
-                (x, y), (x + w, y), (x, y + h), (x + w, y + h),
-                (x + w / 2, y), (x + w / 2, y + h),
-                (x, y + h / 2), (x + w, y + h / 2),
-            ]:
-                cr.rectangle(hx - HANDLE_DRAW, hy - HANDLE_DRAW,
-                             HANDLE_DRAW * 2, HANDLE_DRAW * 2)
-            cr.fill()
-
-        # 6. in-progress tool previews (drawn undimmed, on top)
-        if self._pending_points:
-            self._draw_pending(cr)
-
-        # 7. selected text label (text mode): dashed grab box around it
-        if self.mode == "text" and self.selected_text is not None:
-            bx, by, bw, bh = text_bbox(self.selected_text)
-            hc = self._handle_rgba
-            cr.set_source_rgba(hc.red, hc.green, hc.blue, 0.9)
-            cr.set_line_width(1.0)
-            cr.set_dash([4, 3])
-            cr.rectangle(bx - 4.5, by - 4.5, bw + 9, bh + 9)
-            cr.stroke()
-            cr.set_dash([])
-
-        # 8. live W x H readout near the top-left of the selection
-        pw, ph = self._readout_px()
-        self._draw_badge(cr, "%d × %d" % (pw, ph), x, y)
-
-    def _region_or_rect_path(self, cr, x, y, w, h):
-        if self.region_path:
-            cr.move_to(*self.region_path[0])
-            for pt in self.region_path[1:]:
-                cr.line_to(*pt)
-            cr.close_path()
-        else:
-            cr.rectangle(x, y, w, h)
-
-    def _draw_pending(self, cr):
-        pts = self._pending_points
-        if self.mode == "pen":          # live stroke in its final look
-            self._draw_stroke(cr, self._pending_pen[0], self._pending_pen[1],
-                              pts)
-            return
-        bc = self._border_rgba          # polygon / lasso outline in progress
-        cr.set_source_rgba(bc.red, bc.green, bc.blue, bc.alpha)
-        cr.set_line_width(max(1.0, self._border_width))
-        cr.move_to(*pts[0])
-        for p in pts[1:]:
-            cr.line_to(*p)
-        if self.mode == "polygon":      # rubber-band line to the pointer
-            cr.line_to(*self.pointer)
-        cr.stroke()
-        if self.mode == "polygon":      # vertex dots
-            hc = self._handle_rgba
-            cr.set_source_rgba(hc.red, hc.green, hc.blue, hc.alpha)
-            for p in pts:
-                cr.rectangle(p[0] - 3, p[1] - 3, 6, 6)
-            cr.fill()
+        """Bake committed strokes/texts into the crop (logical coords) — the
+        same routine the on-screen preview node uses."""
+        draw_annotations(cr, self.strokes, self.texts)
 
     def _readout_px(self):
         """Physical pixel size of the current selection — the same function
         the crop uses, so the readout can never disagree with the PNG."""
         return selection_to_physical(self.selection, self.scale,
                                      self.origin_px)[2:]
-
-    def _draw_badge(self, cr, text, x, y):
-        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
-                            cairo.FONT_WEIGHT_NORMAL)
-        cr.set_font_size(13)
-        ext = cr.text_extents(text)
-        pad = 5
-        bw_, bh_ = ext.width + pad * 2, ext.height + pad * 2
-        bx = x
-        by = y - bh_ - 4
-        if by < 0:                       # not enough room above -> put inside
-            by = y + 4
-        bx = max(0, min(bx, self.logical_w - bw_))
-        cr.set_source_rgba(0, 0, 0, 0.65)
-        cr.rectangle(bx, by, bw_, bh_)
-        cr.fill()
-        cr.set_source_rgba(1, 1, 1, 1)
-        cr.move_to(bx + pad - ext.x_bearing, by + pad - ext.y_bearing)
-        cr.show_text(text)
 
     # -- interaction ---------------------------------------------------------
 
@@ -1749,12 +2039,20 @@ class OverlayWindow(Gtk.ApplicationWindow):
 
     def _reposition_toolbar(self):
         x, y, w, h = self.selection
-        # Prefer the real allocation; before first allocation fall back to the
-        # measured natural size (get_width() is 0 until allocated).
-        tb_w = self.toolbar.get_width() \
-            or self.toolbar.measure(Gtk.Orientation.HORIZONTAL, -1)[1] or 280
-        tb_h = self.toolbar.get_height() \
-            or self.toolbar.measure(Gtk.Orientation.VERTICAL, tb_w)[1] or 40
+        tb = self.toolbar
+        tb_w, tb_h = tb.get_width(), tb.get_height()
+        if not tb_w or not tb_h:
+            # Not allocated yet (the window is built and positioned before it
+            # is mapped): fall back to the measured natural size.  measure()
+            # includes the widget's own margins — the very thing this method
+            # sets — so strip them, or a second call would see a toolbar
+            # inflated by its previous position.
+            nat_w = tb.measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+            nat_h = tb.measure(Gtk.Orientation.VERTICAL, -1)[1]
+            tb_w = tb_w or max(1, nat_w - tb.get_margin_start()
+                               - tb.get_margin_end()) or 280
+            tb_h = tb_h or max(1, nat_h - tb.get_margin_top()
+                               - tb.get_margin_bottom()) or 40
         tx = int(max(0, min(x, self.logical_w - tb_w)))
         ty = int(y + h + 8)
         if ty + tb_h > self.logical_h:        # no room below -> above
@@ -1858,7 +2156,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         """Surface a failure instead of silently 'succeeding' and closing.
 
         The fullscreen overlay would hide any stderr message, so on failure we
-        keep the window open, show a banner, and re-arm so the user can retry
+        bring the window back, show a banner, and re-arm so the user can retry
         or press Esc.  A non-zero process exit is also recorded for callers.
         """
         print(f"snapclip: {msg}", file=sys.stderr)
@@ -1867,6 +2165,7 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self.error_label.set_visible(True)
         self._done = False
         self.area.queue_draw()
+        self.present()                  # it was hidden for the attempt
 
     # NOTE on closing: the window quits visible and GNOME plays its normal
     # window-close animation on the frozen shot.  We deliberately do NOT try
@@ -1889,12 +2188,21 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self._finish(save)
 
     def _finish(self, save):
+        # Hide FIRST: GNOME starts its close animation on the frozen shot at
+        # once, and the crop / PNG encode / wl-copy work below runs underneath
+        # that animation instead of holding the overlay on screen while the
+        # user waits.  On failure the window comes straight back (see _fail).
+        self.set_visible(False)
+        self.get_display().flush()      # push the unmap out before we block
+        GLib.idle_add(self._finish_work, save)
+
+    def _finish_work(self, save):
         try:
             png = self._png_bytes()
             copy_png_to_clipboard(png)
         except Exception as exc:
             self._fail(f"copy failed: {exc}")
-            return
+            return False
         if save:
             try:
                 path = save_png(png, self.config["save_dir"],
@@ -1903,10 +2211,11 @@ class OverlayWindow(Gtk.ApplicationWindow):
             except Exception as exc:
                 self._fail(f"saved to clipboard but writing the file "
                            f"failed: {exc}")
-                return
+                return False
         self.app.had_error = False      # a prior failed attempt is now resolved
         self._remember()
         self.app.quit()
+        return False
 
     def do_copy(self):
         # "Always save" makes plain Copy also keep a file on disk.
@@ -1922,6 +2231,21 @@ class OverlayWindow(Gtk.ApplicationWindow):
         self._remove_text_entry(commit=False)
         self._remember()
         self.app.quit()
+
+    def present_overlay(self):
+        """Map the window.  The toolbar was placed from a pre-map measurement;
+        once the first frame has allocated it at its real size (icons and
+        fonts finish loading on map), place it again."""
+        self.present()
+        clock = self.get_frame_clock()
+        if clock is not None and self._first_paint_id is None:
+            self._first_paint_id = clock.connect("after-paint",
+                                                 self._on_first_paint)
+
+    def _on_first_paint(self, clock):
+        clock.disconnect(self._first_paint_id)
+        self._first_paint_id = None
+        self._reposition_toolbar()
 
     # -- settings ------------------------------------------------------------
 
@@ -2037,6 +2361,9 @@ class SettingsDialog(Gtk.Window):
         add("Default size (× screen)", self.size_scale)
         self.remember_sw = switch(self.cfg["remember_selection"],
                                   self._on_remember)
+        self.remember_sw.set_tooltip_text(
+            "Reopen with your previous selection box instead of a fresh "
+            "centered one")
         add("Remember last selection", self.remember_sw)
 
         # ---- Output ---------------------------------------------------------
@@ -2058,24 +2385,44 @@ class SettingsDialog(Gtk.Window):
             "Copy (Enter) also writes a PNG to the save folder")
         add("Always save a copy", self.always_sw)
         self.cursor_sw = switch(self.cfg["include_cursor"], self._on_cursor)
+        self.cursor_sw.set_tooltip_text(
+            "Composite a mouse-pointer glyph into the shot where the cursor is "
+            "(best-effort — the capture itself has no pointer)")
         add("Include mouse cursor", self.cursor_sw)
+        self.quicksave_sw = switch(self.cfg["quick_save_double_tap"],
+                                   self._on_quick_save)
+        self.quicksave_sw.set_tooltip_text(
+            "Double-tap your snapclip hotkey to instantly save the whole screen "
+            "with no overlay. While on, a single tap waits briefly for a "
+            "possible second tap before the overlay appears.")
+        add("Quick-save on double-tap", self.quicksave_sw)
 
         # ---- Tools ----------------------------------------------------------
         section("Tools",
                 "Extra toolbar buttons — all off by default so the overlay "
                 "stays clean")
 
-        def tool_switch(key):
-            return switch(self.cfg[key],
-                          lambda sw, _p: self._on_tool(key, sw))
+        def tool_switch(key, tip):
+            sw = switch(self.cfg[key], lambda sw, _p: self._on_tool(key, sw))
+            sw.set_tooltip_text(tip)
+            return sw
 
-        self.poly_sw = tool_switch("tool_polygon")
+        self.poly_sw = tool_switch(
+            "tool_polygon",
+            "Adds the Poly button — click corners for a polygon selection; "
+            "the shot comes out transparent outside the shape")
         add("Polygon selection", self.poly_sw)
-        self.lasso_sw = tool_switch("tool_lasso")
+        self.lasso_sw = tool_switch(
+            "tool_lasso",
+            "Adds the Lasso button — drag a freehand loop; the shot comes out "
+            "transparent outside the shape")
         add("Freehand selection", self.lasso_sw)
 
         pen_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.pen_sw = tool_switch("tool_pen")
+        self.pen_sw = tool_switch(
+            "tool_pen",
+            "Adds the Pen and Erase buttons — draw strokes onto the shot; "
+            "Ctrl+Z undoes")
         self.pen_color_btn = color_button(self.cfg["pen_color"],
                                           self._on_pen_color)
         self.pen_width_spin = spin(1, 16, self.cfg["pen_width"],
@@ -2086,7 +2433,10 @@ class SettingsDialog(Gtk.Window):
         add("Pen (draw on the shot)", pen_box)
 
         text_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.text_sw = tool_switch("tool_text")
+        self.text_sw = tool_switch(
+            "tool_text",
+            "Adds the Text button — click to place a label; drag to move, "
+            "Delete to remove, Ctrl+Z to undo")
         self.text_color_btn = color_button(self.cfg["text_color"],
                                            self._on_text_color)
         self.text_size_spin = spin(8, 72, self.cfg["text_size"],
@@ -2152,6 +2502,9 @@ class SettingsDialog(Gtk.Window):
         self.cfg["always_save"] = sw.get_active()
         self.overlay.rebuild_toolbar()      # the Copy tooltip mentions it
 
+    def _on_quick_save(self, sw, _p):
+        self.cfg["quick_save_double_tap"] = sw.get_active()
+
     def _on_tool(self, key, sw):
         self.cfg[key] = sw.get_active()
         self.overlay.rebuild_toolbar()
@@ -2198,6 +2551,7 @@ class SettingsDialog(Gtk.Window):
         self.fmt_entry.set_text(self.cfg["filename_format"])
         self.always_sw.set_active(self.cfg["always_save"])
         self.cursor_sw.set_active(self.cfg["include_cursor"])
+        self.quicksave_sw.set_active(self.cfg["quick_save_double_tap"])
         self.poly_sw.set_active(self.cfg["tool_polygon"])
         self.lasso_sw.set_active(self.cfg["tool_lasso"])
         self.pen_sw.set_active(self.cfg["tool_pen"])
@@ -2267,17 +2621,33 @@ CSS = """
 
 
 class SnapClipApp(Gtk.Application):
-    def __init__(self, surface, config, self_test=None, full_desktop=False,
-                 connector=None):
+    """Owns the launch sequence:
+
+      activate -> start the capture worker thread
+               -> (worker reports the primary connector) build + realize the
+                  overlay window on that monitor: widgets, CSS, GL context —
+                  all of GTK's expensive setup — while the frame is captured
+               -> (worker delivers the frame) attach it to the window and
+                  present; or run the self-test; or, with double-tap
+                  quick-save armed, wait out the tap window first.
+
+    Failures are reported on stderr with a non-zero exit, exactly like the
+    old sequential flow; the window is never mapped before the frame exists.
+    """
+
+    def __init__(self, config, self_test=None, allow_flash=False,
+                 launch_us=0, quick_save_on=False):
         super().__init__(application_id=APP_ID,
                          flags=Gio.ApplicationFlags.NON_UNIQUE)
-        self.surface = surface
         self.config = config
         self.self_test = self_test  # None | "copy" | "save"
-        self.full_desktop = full_desktop
-        self.connector = connector
+        self.allow_flash = allow_flash
+        self.launch_us = launch_us
+        self.quick_save_on = quick_save_on
+        self.window = None
         self.test_result = {}
         self.had_error = False
+        self.exit_code = None       # set when a non-overlay path decides it
 
     def do_activate(self):
         # GTK swallows exceptions raised from an activate handler, which would
@@ -2290,18 +2660,138 @@ class SnapClipApp(Gtk.Application):
                 Gdk.Display.get_default(), provider,
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
             )
-            win = OverlayWindow(self, self.surface, self.config,
-                                full_desktop=self.full_desktop,
-                                connector=self.connector)
+            self.hold()                 # keep running until the capture lands
+            threading.Thread(target=self._capture_worker, name="snapclip-capture",
+                             daemon=True).start()
+            # Build and realize right away on the first monitor rather than
+            # waiting for Mutter to name the primary one: realizing (the GPU
+            # renderer's setup) is the longest single step, so it starts as
+            # early as possible; the window is re-targeted — still unmapped —
+            # if the capture turns out to cover another monitor.
+            self._ensure_window(None)
+        except Exception as exc:
+            self._abort(f"failed to start: {exc}")
+
+    # -- capture worker (no GTK in here) --------------------------------------
+
+    def _capture_worker(self):
+        # A private main context keeps the D-Bus signal wait off GTK's loop.
+        ctx = GLib.MainContext.new()
+        ctx.push_thread_default()
+        posted = False
+
+        def on_connector(connector):
+            GLib.idle_add(self._on_connector, connector,
+                          priority=GLib.PRIORITY_HIGH)
+
+        def on_frame(surface, full_desktop, connector):
+            # Hand the frame to the main loop the moment it exists; the
+            # ScreenCast teardown then runs on this thread, off the critical
+            # path to the first visible frame.
+            nonlocal posted
+            texture = texture_for_surface(surface)
+            posted = True
+            GLib.idle_add(self._on_capture,
+                          (surface, texture, full_desktop, connector),
+                          priority=GLib.PRIORITY_HIGH)
+
+        try:
+            capture_screen(allow_flash=self.allow_flash,
+                           on_connector=on_connector, on_frame=on_frame)
+            if posted:
+                return
+            result = CaptureError("capture produced no frame")
+        except CaptureError as exc:
+            if posted:                  # the frame was delivered; the rest
+                return                  # was teardown noise
+            result = exc
+        except Exception as exc:        # never lose the error in a thread
+            if posted:
+                return
+            result = CaptureError(f"capture failed: {exc!r}")
+        finally:
+            ctx.pop_thread_default()
+        GLib.idle_add(self._on_capture, result, priority=GLib.PRIORITY_HIGH)
+
+    # -- main-loop side -------------------------------------------------------
+
+    def _ensure_window(self, connector):
+        if self.window is None:
+            try:
+                monitor = OverlayWindow.pick_monitor(Gdk.Display.get_default(),
+                                                     connector)
+                self.window = OverlayWindow(self, self.config, monitor)
+                if not self.self_test:
+                    # Realize now (GL context, renderer, surface) so present()
+                    # later is just a map; the window stays invisible.
+                    self.window.realize()
+            except Exception as exc:
+                self._abort(f"failed to open the overlay: {exc}")
+        return self.window
+
+    def _on_connector(self, connector):
+        win = self._ensure_window(connector)
+        if win is not None:
+            win.retarget(OverlayWindow.pick_monitor(Gdk.Display.get_default(),
+                                                    connector))
+        return False
+
+    def _on_capture(self, result):
+        try:
+            if isinstance(result, CaptureError):
+                self._abort(str(result), code=2)
+                return False
+            surface, texture, full_desktop, connector = result
+            win = self._ensure_window(connector)
+            if win is None:
+                return False
+            win.set_capture(surface, texture, full_desktop=full_desktop,
+                            connector=connector)
             if self.self_test:
                 self._run_self_test(win)
-                return
-            win.present()
+            else:
+                self._present_or_quick_save(win, surface)
         except Exception as exc:
-            print(f"snapclip: failed to open the overlay: {exc}", file=sys.stderr)
-            self.had_error = True
-            self.test_result.setdefault("error", str(exc))
-            self.quit()
+            self._abort(f"failed to open the overlay: {exc}")
+        finally:
+            self.release()
+        return False
+
+    def _present_or_quick_save(self, win, surface):
+        """Show the overlay — unless a double-tap arrives inside the window."""
+        cfg = self.config
+        if not self.quick_save_on or _quick_save_recent(
+                self.launch_us, _quick_save_cooldown_us(cfg)):
+            win.present_overlay()
+            return
+        # We hold the single-instance lock, so a rapid second press marks a
+        # tap file (see main).  Wait out the rest of the window without
+        # mapping anything; if it was tapped, save the whole screen headlessly
+        # and never show the overlay.  The cooldown makes a mashed key open
+        # the overlay once instead of spamming saves.
+        window_us = _quick_save_window_us(cfg)
+
+        def decide():
+            if _saw_double_tap(self.launch_us, window_us):
+                _record_quick_save(GLib.get_monotonic_time())
+                self.exit_code = quick_save(surface, cfg)
+                self.quit()
+            else:
+                win.present_overlay()
+            return False
+
+        remaining_us = (self.launch_us + window_us) - GLib.get_monotonic_time()
+        if remaining_us > 0:
+            GLib.timeout_add(-(-remaining_us // 1000), decide)   # ceil to ms
+        else:
+            decide()
+
+    def _abort(self, msg, code=1):
+        print(f"snapclip: {msg}", file=sys.stderr)
+        self.had_error = True
+        self.exit_code = code
+        self.test_result.setdefault("error", msg)
+        self.quit()
 
     def _run_self_test(self, win):
         # Use a deterministic selection covering the centre of the screen.
@@ -2335,11 +2825,126 @@ class SnapClipApp(Gtk.Application):
 
 
 # ----------------------------------------------------------------------------
+# Double-tap quick-save: tap the launch hotkey twice quickly to save the whole
+# screen with no overlay.  Each hotkey press is a separate process, so the two
+# taps rendezvous through small files in the runtime dir plus the existing
+# single-instance lock: the first press holds the lock and waits out a short
+# window; a rapid second press fails the lock, drops a timestamp, and exits;
+# the first press sees it and saves headlessly.  A cooldown collapses a burst
+# of presses (key-mashing) into a single save.
+# ----------------------------------------------------------------------------
+
+
+def _double_tap_files():
+    d = GLib.get_user_runtime_dir()
+    return (os.path.join(d, "snapclip.tap"),    # second-tap timestamp
+            os.path.join(d, "snapclip.qs"))     # last quick-save timestamp
+
+
+def _is_double_tap(tap_us, launch_us, window_us):
+    """A recorded second-launch time is a double-tap iff it lands in the window
+    just after our own launch — so stale marks from earlier runs are ignored."""
+    return tap_us is not None and launch_us < tap_us <= launch_us + window_us
+
+
+def _within_cooldown(last_qs_us, now_us, cooldown_us):
+    """True if a quick-save fired within the cooldown: the spam guard that keeps
+    key-mashing (or a bounced key) from writing a burst of files."""
+    return last_qs_us is not None and 0 <= now_us - last_qs_us < cooldown_us
+
+
+def _quick_save_window_us(config):
+    return int(config["double_tap_ms"]) * 1000
+
+
+def _quick_save_cooldown_us(config):
+    # Derived, not a separate knob: a few tap-windows, floored at ~1.2 s.
+    return max(1_200_000, 4 * _quick_save_window_us(config))
+
+
+def _read_us(path):
+    try:
+        with open(path) as fh:
+            return int(fh.read().strip() or "0")
+    except (OSError, ValueError):
+        return None
+
+
+def _write_us(path, value_us):
+    try:
+        with open(path, "w") as fh:
+            fh.write(str(int(value_us)))
+    except OSError:
+        pass                        # best-effort: a lost mark just means no save
+
+
+def _mark_double_tap(launch_us):
+    _write_us(_double_tap_files()[0], launch_us)
+
+
+def _saw_double_tap(launch_us, window_us):
+    return _is_double_tap(_read_us(_double_tap_files()[0]), launch_us, window_us)
+
+
+def _quick_save_recent(now_us, cooldown_us):
+    return _within_cooldown(_read_us(_double_tap_files()[1]), now_us, cooldown_us)
+
+
+def _record_quick_save(now_us):
+    _write_us(_double_tap_files()[1], now_us)
+
+
+def surface_to_png_bytes(surface):
+    """Encode a whole cairo surface to PNG bytes — the headless double-tap
+    quick-save grabs the entire captured frame (no crop, no overlay)."""
+    surface.flush()
+    buf = io.BytesIO()
+    surface.write_to_png(buf)
+    return buf.getvalue()
+
+
+def quick_save(surface, config):
+    """Save + copy the full captured frame with no UI.  Returns an exit code."""
+    png = surface_to_png_bytes(surface)
+    copied = False
+    try:
+        copy_png_to_clipboard(png)
+        copied = True
+    except Exception as exc:
+        print(f"snapclip: quick-save copy failed: {exc}", file=sys.stderr)
+    try:
+        path = save_png(png, config["save_dir"], config["filename_format"])
+        print(f"snapclip: quick-saved {path}")
+    except Exception as exc:
+        print(f"snapclip: quick-save could not write the file: {exc}",
+              file=sys.stderr)
+        return 0 if copied else 2
+    return 0
+
+
+# ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 
 
-def main(argv=None):
+VERSION = "snapclip 1.3"
+
+
+def _which(cmd):
+    """shutil.which for one plain command name, without importing shutil."""
+    for d in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        p = os.path.join(d, cmd)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _parse_args(argv):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if not argv:
+        # The hotkey path: nothing to parse, so skip importing argparse.
+        return types.SimpleNamespace(self_test=None, allow_flash=False)
+    import argparse
     parser = argparse.ArgumentParser(description="Region screenshot tool")
     parser.add_argument("--self-test", choices=["copy", "save"],
                         help="capture + crop + act without the GUI, then exit")
@@ -2347,8 +2952,12 @@ def main(argv=None):
                         help="if flash-free ScreenCast is unavailable, use the "
                              "screenshot portal instead of erroring (the portal "
                              "triggers GNOME's screenshot flash)")
-    parser.add_argument("--version", action="version", version="snapclip 1.2")
-    args = parser.parse_args(argv)
+    parser.add_argument("--version", action="version", version=VERSION)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
 
     # Fail fast on missing session prerequisites: discovering that wl-copy is
     # absent only AFTER the user has framed a selection would throw that work
@@ -2357,12 +2966,14 @@ def main(argv=None):
         print("snapclip: not a Wayland session (WAYLAND_DISPLAY is unset) — "
               "the clipboard step needs wl-copy/Wayland", file=sys.stderr)
         return 2
-    if shutil.which("wl-copy") is None:
+    if _which("wl-copy") is None:
         print("snapclip: wl-copy not found — install the 'wl-clipboard' "
               "package", file=sys.stderr)
         return 2
 
     config = load_config()
+    launch_us = GLib.get_monotonic_time()
+    quick_save_on = bool(config.get("quick_save_double_tap")) and not args.self_test
 
     # Single-instance for the interactive overlay: a second hotkey press must
     # not stack another full-screen overlay. Hold the lock for the whole run.
@@ -2371,18 +2982,19 @@ def main(argv=None):
     if not args.self_test:
         lock = acquire_single_instance_lock()
         if lock is ALREADY_RUNNING:
-            print("snapclip: a snapclip overlay is already open", file=sys.stderr)
+            # Another overlay already holds the lock. With double-tap quick-save
+            # on, leave a timestamp so that instance can fire a headless save;
+            # otherwise a second press is the usual no-op.
+            if quick_save_on:
+                _mark_double_tap(launch_us)
+            else:
+                print("snapclip: a snapclip overlay is already open",
+                      file=sys.stderr)
             return 0
 
-    try:
-        surface, full_desktop, connector = \
-            capture_screen(allow_flash=args.allow_flash)
-    except CaptureError as exc:
-        print(f"snapclip: {exc}", file=sys.stderr)
-        return 2
-
-    app = SnapClipApp(surface, config, self_test=args.self_test,
-                      full_desktop=full_desktop, connector=connector)
+    app = SnapClipApp(config, self_test=args.self_test,
+                      allow_flash=args.allow_flash, launch_us=launch_us,
+                      quick_save_on=quick_save_on)
     app.run([])
     # `lock` stays referenced until here so the flock is held for the whole
     # session; it releases automatically when the process exits.
@@ -2392,8 +3004,24 @@ def main(argv=None):
         ok = r.get("copied") and r.get("png_len", 0) > 0
         print("SELF-TEST", "PASS" if ok else "FAIL", r)
         return 0 if ok else 1
+    if app.exit_code is not None:
+        return app.exit_code
     return 1 if app.had_error else 0
 
 
+def run(argv=None):
+    """Run main() and exit immediately.
+
+    GTK/interpreter teardown takes ~100 ms here, during which the process would
+    still hold the single-instance lock — and, on cancel, the window.  All
+    output is written and flushed, the config is already on disk, and wl-copy's
+    daemon is a separate process, so there is nothing left to tear down.
+    """
+    code = main(argv)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    run()
