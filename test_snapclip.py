@@ -813,6 +813,8 @@ finally:
 print("multi-monitor discovery & target resolution")
 monitors = sc._list_monitors()
 check("monitors discovered", len(monitors) >= 1)
+check("monitors have stage dimensions",
+      all(m.get("stage_width", 0) > 0 and m.get("stage_height", 0) > 0 for m in monitors))
 check("primary monitor resolved with 'primary'", sc._resolve_target_monitor(target="primary")["primary"] is True)
 check("monitor resolved by numeric index 0", sc._resolve_target_monitor(target=0)["index"] == 0)
 check("monitor resolved by string index '0'", sc._resolve_target_monitor(target="0")["index"] == 0)

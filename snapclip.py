@@ -376,6 +376,8 @@ def _list_monitors(bus=None):
                     break
             conn_meta[conn] = {"display_name": display_name, "res": res}
 
+        layout_mode = _props.get("layout-mode", 1) if isinstance(_props, dict) else 1
+
         # Sort by screen coordinates (x, then y) to provide consistent indexing
         sorted_logical = sorted(logical, key=lambda lm: (lm[0], lm[1]))
         monitors = []
@@ -386,6 +388,38 @@ def _list_monitors(bus=None):
                 meta = conn_meta.get(conn, {"display_name": "", "res": (0, 0)})
                 name = meta["display_name"] or conn
                 w, h = meta["res"]
+                scale = float(lm[2]) if float(lm[2]) > 0 else 1.0
+                transform = int(lm[3]) if len(lm) > 3 else 0
+
+                # If rotated 90 or 270 degrees, physical mode dimensions are transposed
+                if transform in (1, 3, 5, 7):
+                    pw, ph = h, w
+                else:
+                    pw, ph = w, h
+
+                # RecordArea takes compositor stage (logical) coordinates, NOT physical mode pixels.
+                # In logical layout mode (GNOME's default on Wayland), stage dimensions are physical / scale.
+                if layout_mode == 1 and scale > 0:
+                    stage_w = int(round(pw / scale))
+                    stage_h = int(round(ph / scale))
+                else:
+                    stage_w = pw
+                    stage_h = ph
+
+                # If GDK display is available, its monitor geometry directly reflects
+                # the compositor's logical stage coordinates.
+                try:
+                    display = Gdk.Display.get_default()
+                    if display is not None:
+                        for gm in display.get_monitors():
+                            if gm.get_connector() == conn:
+                                geo = gm.get_geometry()
+                                stage_w = geo.width
+                                stage_h = geo.height
+                                break
+                except Exception:
+                    pass
+
                 monitors.append({
                     "index": idx,
                     "connector": conn,
@@ -395,7 +429,11 @@ def _list_monitors(bus=None):
                     "y": int(lm[1]),
                     "width": int(w),
                     "height": int(h),
-                    "scale": float(lm[2]),
+                    "scale": scale,
+                    "stage_x": int(lm[0]),
+                    "stage_y": int(lm[1]),
+                    "stage_width": stage_w,
+                    "stage_height": stage_h,
                 })
         return monitors
     except Exception:
@@ -410,6 +448,7 @@ def _list_monitors(bus=None):
                     geo = m.get_geometry()
                     conn = m.get_connector() or f"MON-{idx}"
                     desc = m.get_description() or conn
+                    mscale = float(getattr(m, "get_scale", lambda: 1.0)())
                     monitors.append({
                         "index": idx,
                         "connector": conn,
@@ -417,9 +456,13 @@ def _list_monitors(bus=None):
                         "primary": idx == 0,
                         "x": geo.x,
                         "y": geo.y,
-                        "width": geo.width,
-                        "height": geo.height,
-                        "scale": 1.0,
+                        "width": int(round(geo.width * mscale)),
+                        "height": int(round(geo.height * mscale)),
+                        "scale": mscale,
+                        "stage_x": geo.x,
+                        "stage_y": geo.y,
+                        "stage_width": geo.width,
+                        "stage_height": geo.height,
                     })
         except Exception:
             pass
@@ -591,17 +634,22 @@ def screencast_capture(timeout_s=10, on_connector=None, on_frame=None, target_mo
             )
             session = r.unpack()[0]
             stream = None
-            # If coordinates and dimensions are known, RecordArea captures from
+            # RecordArea takes stage (logical) coordinates, NOT physical mode pixels.
+            # If stage coordinates and dimensions are known, RecordArea captures from
             # Mutter's compositor stage directly without waiting for KMS pageflip/damage
             # events (crucial for idle secondary displays or PSR/VRR laptop panels).
-            if mon_info.get("width", 0) > 0 and mon_info.get("height", 0) > 0:
+            stage_w = mon_info.get("stage_width") or mon_info.get("width", 0)
+            stage_h = mon_info.get("stage_height") or mon_info.get("height", 0)
+            stage_x = mon_info.get("stage_x", mon_info.get("x", 0))
+            stage_y = mon_info.get("stage_y", mon_info.get("y", 0))
+
+            if stage_w > 0 and stage_h > 0:
                 try:
                     r = bus.call_sync(
                         "org.gnome.Mutter.ScreenCast", session,
                         "org.gnome.Mutter.ScreenCast.Session", "RecordArea",
                         GLib.Variant("(iiiia{sv})",
-                                     (mon_info["x"], mon_info["y"],
-                                      mon_info["width"], mon_info["height"],
+                                     (stage_x, stage_y, stage_w, stage_h,
                                       {"cursor-mode": GLib.Variant("u", 0)})),
                         None, Gio.DBusCallFlags.NONE, -1, None,
                     )
@@ -2847,7 +2895,11 @@ class SnapClipApp(Gtk.Application):
             # if the capture turns out to cover another monitor.
             initial_connector = None
             if self.target_monitor and self.target_monitor.lower() != "primary":
-                initial_connector = self.target_monitor
+                try:
+                    target_info = _resolve_target_monitor(target=self.target_monitor)
+                    initial_connector = target_info.get("connector")
+                except Exception:
+                    initial_connector = self.target_monitor
             self._ensure_window(initial_connector)
         except Exception as exc:
             self._abort(f"failed to start: {exc}")
