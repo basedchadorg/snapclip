@@ -138,6 +138,21 @@ Copy puts the crop on the clipboard as `image/png` and **never writes a file**.
 Save additionally writes `~/Pictures/Screenshots/snapclip-YYYY-MM-DD_HH-MM-SS.png`
 (folder/format configurable).
 
+### Multi-monitor & CLI options
+
+snapclip can target any connected display:
+
+```bash
+snapclip --list-monitors      # (or -l) show connected monitors with index and friendly name
+snapclip -m 0                 # capture first monitor by index
+snapclip -m 1                 # capture second monitor by index
+snapclip -m HDMI-1            # capture by connector name
+snapclip -m "Built-in"        # capture by friendly name substring
+snapclip --monitor primary    # capture primary display
+```
+
+You can bind separate hotkeys for each monitor (e.g., `Super+Shift+1` for `snapclip -m 0` and `Super+Shift+2` for `snapclip -m 1`), or configure your preferred screen in ⚙ settings.
+
 ### Bind it to a hotkey (recommended)
 
 GNOME → **Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts → +**
@@ -161,6 +176,7 @@ apply live and are written once when the dialog closes.
 
 | Setting | Default | Notes |
 |---|---|---|
+| Default monitor | `Primary` | Default display to capture when no `-m` flag is given (Primary or specific display) |
 | Border colour | `#0077CC` | Selection outline colour (WCAG-distinct from pen/text defaults) |
 | Border width | `2` | px |
 | Outside dim | `0.35` | Darkening **outside** the selection; interior is always see-through. `0` = none |
@@ -273,8 +289,8 @@ Yes. It captures the monitor the overlay opens on and scales the crop by
 
 ## Limitations
 
-- The overlay opens on the **primary** monitor (ScreenCast grabs exactly that
-  monitor, so the crop is offset-correct at any scale).
+- By default, the overlay opens on the primary or configured monitor; use `-m` / `--monitor`
+  or settings to target other connected screens.
 - "Include cursor" is best-effort (the capture excludes the real pointer).
 - Requires `org.gnome.Mutter.ScreenCast` (GNOME Wayland). On stripped-down setups
   without it, pass `--allow-flash` to use the portal (which flashes).

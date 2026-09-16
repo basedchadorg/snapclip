@@ -116,6 +116,7 @@ DEFAULT_CONFIG = {
     # Default colours are chosen as a WCAG set: border vs pen vs text have
     # pairwise contrast ratios >= 3:1 (WCAG 1.4.11), so the three elements
     # are distinguishable out of the box.  Users can still pick anything.
+    "default_monitor": "primary",    # "primary", index ("0", "1"), or connector name ("HDMI-1", "eDP-1")
     "border_color": "#0077CC",      # selection outline colour
     "border_width": 2,               # outline thickness (px)
     "handle_color": "#FFFFFF",       # corner/edge handle colour
@@ -164,6 +165,10 @@ def load_config():
 def _sanitize_config(cfg):
     """Coerce wrong-typed / null fields back to safe defaults so a hand-edited
     or partially-written config can never crash capture or save."""
+    if not isinstance(cfg.get("default_monitor"), (str, int)):
+        cfg["default_monitor"] = DEFAULT_CONFIG["default_monitor"]
+    else:
+        cfg["default_monitor"] = str(cfg["default_monitor"]).strip() or "primary"
     for key in ("save_dir", "filename_format", "border_color", "handle_color",
                 "pen_color", "text_color"):
         if not isinstance(cfg.get(key), str) or not cfg[key]:
@@ -339,24 +344,146 @@ def portal_capture(timeout_s=30):
     return surface
 
 
-def _primary_connector(bus):
-    """Connector name (e.g. 'HDMI-1') of the primary monitor, via Mutter."""
+def _get_session_bus(bus=None):
+    if bus is not None:
+        return bus
     try:
-        r = bus.call_sync(
+        return Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except GLib.Error as exc:
+        raise CaptureError(f"cannot reach the session bus: {exc}")
+
+
+def _list_monitors(bus=None):
+    """List detected monitors with indices, connectors, friendly names,
+    resolutions, and primary status via Mutter DisplayConfig."""
+    try:
+        b = _get_session_bus(bus)
+        r = b.call_sync(
             "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
             "org.gnome.Mutter.DisplayConfig", "GetCurrentState",
             None, None, Gio.DBusCallFlags.NONE, -1, None,
         )
-        _serial, _monitors, logical, _props = r.unpack()
-        for lm in logical:
+        _serial, mutter_monitors, logical, _props = r.unpack()
+        conn_meta = {}
+        for m in mutter_monitors:
+            # m = ((connector, vendor, product, serial), modes, props)
+            conn = m[0][0]
+            display_name = m[2].get("display-name", "")
+            res = (0, 0)
+            for mode in m[1]:
+                if mode[6].get("is-current"):
+                    res = (mode[1], mode[2])
+                    break
+            conn_meta[conn] = {"display_name": display_name, "res": res}
+
+        # Sort by screen coordinates (x, then y) to provide consistent indexing
+        sorted_logical = sorted(logical, key=lambda lm: (lm[0], lm[1]))
+        monitors = []
+        for idx, lm in enumerate(sorted_logical):
             # lm = (x, y, scale, transform, primary, [(connector, ...)], props)
-            if lm[4] and lm[5]:
-                return lm[5][0][0]
-        if logical and logical[0][5]:
-            return logical[0][5][0][0]
-    except (GLib.Error, IndexError, ValueError, TypeError) as exc:
-        raise CaptureError(f"could not determine the primary monitor: {exc}")
-    raise CaptureError("no monitor reported by Mutter")
+            if lm[5]:
+                conn = lm[5][0][0]
+                meta = conn_meta.get(conn, {"display_name": "", "res": (0, 0)})
+                name = meta["display_name"] or conn
+                w, h = meta["res"]
+                monitors.append({
+                    "index": idx,
+                    "connector": conn,
+                    "name": name,
+                    "primary": bool(lm[4]),
+                    "x": int(lm[0]),
+                    "y": int(lm[1]),
+                    "width": int(w),
+                    "height": int(h),
+                    "scale": float(lm[2]),
+                })
+        return monitors
+    except Exception:
+        # Fallback to Gdk monitors if Mutter DisplayConfig is unreachable
+        monitors = []
+        try:
+            display = Gdk.Display.get_default()
+            if display is not None:
+                g_monitors = display.get_monitors()
+                for idx in range(g_monitors.get_n_items()):
+                    m = g_monitors.get_item(idx)
+                    geo = m.get_geometry()
+                    conn = m.get_connector() or f"MON-{idx}"
+                    desc = m.get_description() or conn
+                    monitors.append({
+                        "index": idx,
+                        "connector": conn,
+                        "name": desc,
+                        "primary": idx == 0,
+                        "x": geo.x,
+                        "y": geo.y,
+                        "width": geo.width,
+                        "height": geo.height,
+                        "scale": 1.0,
+                    })
+        except Exception:
+            pass
+        return monitors
+
+
+def _resolve_target_monitor(bus=None, target="primary"):
+    """Find target monitor dict by index, connector name, friendly name, or 'primary'."""
+    monitors = _list_monitors(bus)
+    if not monitors:
+        raise CaptureError("no monitor reported by Mutter")
+    if target is None:
+        target = "primary"
+    target_str = str(target).strip()
+
+    # 1. "primary" keyword
+    if target_str.lower() == "primary":
+        for m in monitors:
+            if m["primary"]:
+                return m
+        return monitors[0]
+
+    # 2. Integer index ("0", "1", 0, 1)
+    try:
+        idx = int(target_str)
+        if 0 <= idx < len(monitors):
+            return monitors[idx]
+    except ValueError:
+        pass
+
+    # 3. Exact connector name match (case-insensitive: "HDMI-1", "edp-1")
+    for m in monitors:
+        if m["connector"].lower() == target_str.lower():
+            return m
+
+    # 4. Friendly name substring match (case-insensitive: "LG", "Built-in")
+    for m in monitors:
+        if target_str.lower() in m["name"].lower():
+            return m
+
+    # Fallback to primary if not found
+    print(f"snapclip: monitor '{target}' not found; falling back to primary",
+          file=sys.stderr)
+    for m in monitors:
+        if m["primary"]:
+            return m
+    return monitors[0]
+
+
+def _primary_connector(bus):
+    """Connector name (e.g. 'HDMI-1') of the primary monitor, via Mutter."""
+    return _resolve_target_monitor(bus, "primary")["connector"]
+
+
+def _print_monitors(bus=None):
+    monitors = _list_monitors(bus)
+    if not monitors:
+        print("No monitors detected.", file=sys.stderr)
+        return
+    print("Available monitors:")
+    for m in monitors:
+        pri = " [Primary]" if m["primary"] else ""
+        res_str = f" ({m['width']}x{m['height']})" if m["width"] and m["height"] else ""
+        print(f"  [{m['index']}] {m['connector']}: {m['name']}{res_str}{pri}")
 
 
 def _sample_to_surface(sample):
@@ -428,8 +555,8 @@ def texture_for_surface(surface):
         Gdk.MemoryFormat.B8G8R8X8, data, surface.get_stride())
 
 
-def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
-    """Grab one frame of the primary monitor via Mutter ScreenCast + PipeWire.
+def screencast_capture(timeout_s=10, on_connector=None, on_frame=None, target_monitor=None):
+    """Grab one frame of the target monitor via Mutter ScreenCast + PipeWire.
 
     Returns (surface, connector): a cairo.ImageSurface (physical pixels of that
     monitor) and the connector name that was captured (e.g. 'HDMI-1'), so the
@@ -443,11 +570,12 @@ def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
     Raises CaptureError if ScreenCast/GStreamer is unavailable.
     """
     try:
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus = _get_session_bus()
     except GLib.Error as exc:
         raise CaptureError(f"cannot reach the session bus: {exc}")
 
-    connector = _primary_connector(bus)
+    mon_info = _resolve_target_monitor(bus, target_monitor)
+    connector = mon_info["connector"]
     if on_connector is not None:
         on_connector(connector)
     session = None
@@ -462,14 +590,33 @@ def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
                 None, Gio.DBusCallFlags.NONE, -1, None,
             )
             session = r.unpack()[0]
-            r = bus.call_sync(
-                "org.gnome.Mutter.ScreenCast", session,
-                "org.gnome.Mutter.ScreenCast.Session", "RecordMonitor",
-                GLib.Variant("(sa{sv})",
-                             (connector, {"cursor-mode": GLib.Variant("u", 0)})),
-                None, Gio.DBusCallFlags.NONE, -1, None,
-            )
-            stream = r.unpack()[0]
+            stream = None
+            # If coordinates and dimensions are known, RecordArea captures from
+            # Mutter's compositor stage directly without waiting for KMS pageflip/damage
+            # events (crucial for idle secondary displays or PSR/VRR laptop panels).
+            if mon_info.get("width", 0) > 0 and mon_info.get("height", 0) > 0:
+                try:
+                    r = bus.call_sync(
+                        "org.gnome.Mutter.ScreenCast", session,
+                        "org.gnome.Mutter.ScreenCast.Session", "RecordArea",
+                        GLib.Variant("(iiiia{sv})",
+                                     (mon_info["x"], mon_info["y"],
+                                      mon_info["width"], mon_info["height"],
+                                      {"cursor-mode": GLib.Variant("u", 0)})),
+                        None, Gio.DBusCallFlags.NONE, -1, None,
+                    )
+                    stream = r.unpack()[0]
+                except GLib.Error:
+                    stream = None
+            if stream is None:
+                r = bus.call_sync(
+                    "org.gnome.Mutter.ScreenCast", session,
+                    "org.gnome.Mutter.ScreenCast.Session", "RecordMonitor",
+                    GLib.Variant("(sa{sv})",
+                                 (connector, {"cursor-mode": GLib.Variant("u", 0)})),
+                    None, Gio.DBusCallFlags.NONE, -1, None,
+                )
+                stream = r.unpack()[0]
         except GLib.Error as exc:
             raise CaptureError(f"Mutter ScreenCast setup failed: {exc}")
 
@@ -547,8 +694,8 @@ def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
                 pass
 
 
-def capture_screen(allow_flash=False, on_connector=None, on_frame=None):
-    """Capture the primary monitor, flash-free.
+def capture_screen(allow_flash=False, on_connector=None, on_frame=None, target_monitor=None):
+    """Capture the target monitor, flash-free.
 
     Uses Mutter ScreenCast, which does not flash.  If that is unavailable we
     REFUSE to capture by default rather than silently flashing — the whole
@@ -577,7 +724,8 @@ def capture_screen(allow_flash=False, on_connector=None, on_frame=None):
 
     try:
         surface, connector = screencast_capture(on_connector=_connector,
-                                                on_frame=_frame)
+                                                on_frame=_frame,
+                                                target_monitor=target_monitor)
         return surface, False, connector
     except CaptureError as exc:
         if not allow_flash:
@@ -2340,6 +2488,28 @@ class SettingsDialog(Gtk.Window):
 
         # ---- Selection ------------------------------------------------------
         section("Selection")
+        monitors = _list_monitors()
+        self.monitor_items = ["Primary"]
+        self.monitor_values = ["primary"]
+        selected_idx = 0
+        current_cfg = str(self.cfg.get("default_monitor", "primary")).strip()
+
+        for idx, m in enumerate(monitors):
+            label = f"{m['index']}: {m['connector']} ({m['name']})"
+            self.monitor_items.append(label)
+            self.monitor_values.append(m["connector"])
+            if current_cfg.lower() == m["connector"].lower():
+                selected_idx = idx + 1
+            elif current_cfg.isdigit() and int(current_cfg) == m["index"]:
+                selected_idx = idx + 1
+
+        self.monitor_dd = Gtk.DropDown.new_from_strings(self.monitor_items)
+        self.monitor_dd.set_selected(selected_idx)
+        self.monitor_dd.connect("notify::selected", self._on_monitor_selected)
+        self.monitor_dd.set_tooltip_text(
+            "Default monitor to capture when no -m/--monitor flag is specified")
+        add("Default monitor", self.monitor_dd)
+
         self.color_btn = color_button(self.cfg["border_color"], self._on_color)
         add("Border colour", self.color_btn)
         self.width_spin = spin(1, 12, self.cfg["border_width"],
@@ -2486,6 +2656,11 @@ class SettingsDialog(Gtk.Window):
     def _on_cursor(self, sw, _p):
         self.cfg["include_cursor"] = sw.get_active()
 
+    def _on_monitor_selected(self, dd, _p):
+        idx = dd.get_selected()
+        if 0 <= idx < len(self.monitor_values):
+            self.cfg["default_monitor"] = self.monitor_values[idx]
+
     def _on_remember(self, sw, _p):
         self.cfg["remember_selection"] = sw.get_active()
 
@@ -2541,6 +2716,7 @@ class SettingsDialog(Gtk.Window):
         for k, v in DEFAULT_CONFIG.items():
             if k != "last_selection":
                 self.cfg[k] = v
+        self.monitor_dd.set_selected(0)
         rgba = Gdk.RGBA(); rgba.parse(self.cfg["border_color"])
         self.color_btn.set_rgba(rgba)
         self.width_spin.set_value(self.cfg["border_width"])
@@ -2636,7 +2812,7 @@ class SnapClipApp(Gtk.Application):
     """
 
     def __init__(self, config, self_test=None, allow_flash=False,
-                 launch_us=0, quick_save_on=False):
+                 launch_us=0, quick_save_on=False, target_monitor=None):
         super().__init__(application_id=APP_ID,
                          flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.config = config
@@ -2644,6 +2820,7 @@ class SnapClipApp(Gtk.Application):
         self.allow_flash = allow_flash
         self.launch_us = launch_us
         self.quick_save_on = quick_save_on
+        self.target_monitor = target_monitor or config.get("default_monitor", "primary")
         self.window = None
         self.test_result = {}
         self.had_error = False
@@ -2668,7 +2845,10 @@ class SnapClipApp(Gtk.Application):
             # renderer's setup) is the longest single step, so it starts as
             # early as possible; the window is re-targeted — still unmapped —
             # if the capture turns out to cover another monitor.
-            self._ensure_window(None)
+            initial_connector = None
+            if self.target_monitor and self.target_monitor.lower() != "primary":
+                initial_connector = self.target_monitor
+            self._ensure_window(initial_connector)
         except Exception as exc:
             self._abort(f"failed to start: {exc}")
 
@@ -2697,7 +2877,8 @@ class SnapClipApp(Gtk.Application):
 
         try:
             capture_screen(allow_flash=self.allow_flash,
-                           on_connector=on_connector, on_frame=on_frame)
+                           on_connector=on_connector, on_frame=on_frame,
+                           target_monitor=self.target_monitor)
             if posted:
                 return
             result = CaptureError("capture produced no frame")
@@ -2943,9 +3124,15 @@ def _parse_args(argv):
     argv = sys.argv[1:] if argv is None else list(argv)
     if not argv:
         # The hotkey path: nothing to parse, so skip importing argparse.
-        return types.SimpleNamespace(self_test=None, allow_flash=False)
+        return types.SimpleNamespace(self_test=None, allow_flash=False,
+                                     monitor=None, list_monitors=False)
     import argparse
     parser = argparse.ArgumentParser(description="Region screenshot tool")
+    parser.add_argument("-m", "--monitor", metavar="MONITOR",
+                        help="target monitor: index (0, 1, ...), connector name "
+                             "(HDMI-1, eDP-1), friendly name substring, or 'primary'")
+    parser.add_argument("-l", "--list-monitors", action="store_true",
+                        help="list detected monitors and exit")
     parser.add_argument("--self-test", choices=["copy", "save"],
                         help="capture + crop + act without the GUI, then exit")
     parser.add_argument("--allow-flash", action="store_true",
@@ -2958,6 +3145,10 @@ def _parse_args(argv):
 
 def main(argv=None):
     args = _parse_args(argv)
+
+    if getattr(args, "list_monitors", False):
+        _print_monitors()
+        return 0
 
     # Fail fast on missing session prerequisites: discovering that wl-copy is
     # absent only AFTER the user has framed a selection would throw that work
@@ -2974,6 +3165,7 @@ def main(argv=None):
     config = load_config()
     launch_us = GLib.get_monotonic_time()
     quick_save_on = bool(config.get("quick_save_double_tap")) and not args.self_test
+    target_monitor = getattr(args, "monitor", None) or config.get("default_monitor", "primary")
 
     # Single-instance for the interactive overlay: a second hotkey press must
     # not stack another full-screen overlay. Hold the lock for the whole run.
@@ -2994,7 +3186,7 @@ def main(argv=None):
 
     app = SnapClipApp(config, self_test=args.self_test,
                       allow_flash=args.allow_flash, launch_us=launch_us,
-                      quick_save_on=quick_save_on)
+                      quick_save_on=quick_save_on, target_monitor=target_monitor)
     app.run([])
     # `lock` stays referenced until here so the flock is held for the whole
     # session; it releases automatically when the process exits.

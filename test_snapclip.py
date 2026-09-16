@@ -641,9 +641,17 @@ check("near-full box is remembered, not discarded",
 print("launch helpers (argument parsing, PATH lookup, signal wait, launcher)")
 _a = sc._parse_args([])
 check("no arguments -> interactive defaults without argparse",
-      _a.self_test is None and _a.allow_flash is False)
+      _a.self_test is None and _a.allow_flash is False and _a.monitor is None and _a.list_monitors is False)
 _a = sc._parse_args(["--allow-flash", "--self-test", "save"])
 check("flags parsed", _a.self_test == "save" and _a.allow_flash is True)
+_am = sc._parse_args(["-m", "1"])
+check("-m flag parsed", _am.monitor == "1")
+_am_long = sc._parse_args(["--monitor", "HDMI-1"])
+check("--monitor flag parsed", _am_long.monitor == "HDMI-1")
+_al = sc._parse_args(["-l"])
+check("-l flag parsed", _al.list_monitors is True)
+_al_long = sc._parse_args(["--list-monitors"])
+check("--list-monitors flag parsed", _al_long.list_monitors is True)
 import shutil  # noqa: E402
 check("_which agrees with shutil.which", sc._which("wl-copy") == shutil.which("wl-copy"))
 check("_which misses a bogus command", sc._which("snapclip-no-such-tool-xyz") is None)
@@ -788,8 +796,36 @@ try:
         check("bad pen_color coerced",
               cfg8["pen_color"] == sc.DEFAULT_CONFIG["pen_color"])
         check("non-bool tool flag coerced", cfg8["tool_pen"] is False)
+        # default_monitor config
+        check("default_monitor defaults to primary", sc.DEFAULT_CONFIG["default_monitor"] == "primary")
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"default_monitor": 123}, fh)
+        cfg_m = sc.load_config()
+        check("int default_monitor coerced to string", cfg_m["default_monitor"] == "123")
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"default_monitor": None}, fh)
+        cfg_m2 = sc.load_config()
+        check("null default_monitor coerced to default", cfg_m2["default_monitor"] == "primary")
 finally:
     sc.CONFIG_PATH = orig
+
+# ---------------------------------------------------------------------------
+print("multi-monitor discovery & target resolution")
+monitors = sc._list_monitors()
+check("monitors discovered", len(monitors) >= 1)
+check("primary monitor resolved with 'primary'", sc._resolve_target_monitor(target="primary")["primary"] is True)
+check("monitor resolved by numeric index 0", sc._resolve_target_monitor(target=0)["index"] == 0)
+check("monitor resolved by string index '0'", sc._resolve_target_monitor(target="0")["index"] == 0)
+if len(monitors) > 1:
+    check("secondary monitor resolved by index 1", sc._resolve_target_monitor(target=1)["index"] == 1)
+    sec_conn = monitors[1]["connector"]
+    check("secondary monitor resolved by connector", sc._resolve_target_monitor(target=sec_conn)["connector"] == sec_conn)
+first_conn = monitors[0]["connector"]
+check("monitor resolved by connector name", sc._resolve_target_monitor(target=first_conn)["connector"] == first_conn)
+first_name = monitors[0]["name"]
+if len(first_name) >= 2:
+    check("monitor resolved by friendly name substring", sc._resolve_target_monitor(target=first_name[:3])["connector"] == first_conn)
+check("unknown monitor falls back to primary", sc._resolve_target_monitor(target="NONEXISTENT_MONITOR")["primary"] is True)
 
 # ---------------------------------------------------------------------------
 print("ScreenCast capture (flash-free, primary path)")
