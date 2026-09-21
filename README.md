@@ -252,6 +252,11 @@ tool is built around latency:
 - **`snapclip` (the launcher) imports `snapclip.py`** so Python caches its
   bytecode; running the `.py` directly still works but recompiles it each time.
 
+## Contributing
+
+Pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md) for how
+reviews work, how credit is handled, and what keeps this tool small.
+
 ## Testing
 
 ```bash
