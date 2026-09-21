@@ -141,6 +141,25 @@ Copy puts the crop on the clipboard as `image/png` and **never writes a file**.
 Save additionally writes `~/Pictures/Screenshots/snapclip-YYYY-MM-DD_HH-MM-SS.png`
 (folder/format configurable).
 
+### Multi-monitor
+
+snapclip captures the **primary** monitor unless told otherwise:
+
+```bash
+snapclip -l                   # list monitors: index, connector, name, [Primary]
+snapclip -m HDMI-1            # capture by connector name (recommended for hotkeys)
+snapclip -m 1                 # ...or by index, as printed by -l
+snapclip -m "Built-in"        # ...or by a substring of the display name
+```
+
+Indices are assigned left-to-right by screen position, so they can change
+when a monitor is plugged in or rearranged; connector names stay put, which
+makes them the safer choice for a hotkey (e.g. `Super+Shift+1` →
+`snapclip -m eDP-1`, `Super+Shift+2` → `snapclip -m HDMI-1`). An unknown
+target falls back to the primary monitor with a note on stderr rather than
+refusing to shoot. With two or more monitors, ⚙ settings also gains a
+**Default monitor** row for launches without `-m`.
+
 ### Bind it to a hotkey (recommended)
 
 GNOME → **Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts → +**
@@ -164,6 +183,7 @@ apply live and are written once when the dialog closes.
 
 | Setting | Default | Notes |
 |---|---|---|
+| Default monitor | `primary` | Monitor to capture when no `-m` flag is given; the row appears only with two or more monitors |
 | Border colour | `#0077CC` | Selection outline colour (WCAG-distinct from pen/text defaults) |
 | Border width | `2` | px |
 | Outside dim | `0.35` | Darkening **outside** the selection; interior is always see-through. `0` = none |
@@ -296,8 +316,9 @@ Yes. It captures the monitor the overlay opens on and scales the crop by
 
 ## Limitations
 
-- The overlay opens on the **primary** monitor (ScreenCast grabs exactly that
-  monitor, so the crop is offset-correct at any scale).
+- One monitor per shot: the overlay opens on the primary (or the `-m` /
+  configured) monitor and the crop is offset-correct at any scale there; a
+  selection cannot span two screens.
 - "Include cursor" is best-effort (the capture excludes the real pointer).
 - Requires `org.gnome.Mutter.ScreenCast` (GNOME Wayland). On stripped-down setups
   without it, pass `--allow-flash` to use the portal (which flashes).

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Multi-monitor targeting** (from PR #1 by @basedchadorg, reworked):
+  `-l` / `--list-monitors` prints the connected displays; `-m` / `--monitor`
+  picks one by connector name, index (left-to-right by position) or a
+  substring of its display name, `primary` being the default. An unknown
+  target falls back to the primary monitor with one stderr notice. With two
+  or more monitors the settings dialog gains a **Default monitor** row
+  (config key `default_monitor`); single-monitor setups see no new UI.
+  Monitor discovery is a single DisplayConfig call on the capture worker
+  (no GDK off the main thread, no second round trip on the main thread) and
+  shares the 1.4 RecordArea rectangle derivation, so the PR's own
+  RecordArea change folded into it.
+
 ## 1.4 — 2026-09-21
 
 ### Fixed

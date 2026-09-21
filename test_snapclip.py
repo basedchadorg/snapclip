@@ -641,9 +641,17 @@ check("near-full box is remembered, not discarded",
 print("launch helpers (argument parsing, PATH lookup, signal wait, launcher)")
 _a = sc._parse_args([])
 check("no arguments -> interactive defaults without argparse",
-      _a.self_test is None and _a.allow_flash is False)
+      _a.self_test is None and _a.allow_flash is False and _a.monitor is None and _a.list_monitors is False)
 _a = sc._parse_args(["--allow-flash", "--self-test", "save"])
 check("flags parsed", _a.self_test == "save" and _a.allow_flash is True)
+_am = sc._parse_args(["-m", "1"])
+check("-m flag parsed", _am.monitor == "1")
+_am_long = sc._parse_args(["--monitor", "HDMI-1"])
+check("--monitor flag parsed", _am_long.monitor == "HDMI-1")
+_al = sc._parse_args(["-l"])
+check("-l flag parsed", _al.list_monitors is True)
+_al_long = sc._parse_args(["--list-monitors"])
+check("--list-monitors flag parsed", _al_long.list_monitors is True)
 import shutil  # noqa: E402
 check("_which agrees with shutil.which", sc._which("wl-copy") == shutil.which("wl-copy"))
 check("_which misses a bogus command", sc._which("snapclip-no-such-tool-xyz") is None)
@@ -788,6 +796,16 @@ try:
         check("bad pen_color coerced",
               cfg8["pen_color"] == sc.DEFAULT_CONFIG["pen_color"])
         check("non-bool tool flag coerced", cfg8["tool_pen"] is False)
+        # default_monitor config
+        check("default_monitor defaults to primary", sc.DEFAULT_CONFIG["default_monitor"] == "primary")
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"default_monitor": 123}, fh)
+        cfg_m = sc.load_config()
+        check("int default_monitor coerced to string", cfg_m["default_monitor"] == "123")
+        with open(sc.CONFIG_PATH, "w") as fh:
+            json.dump({"default_monitor": None}, fh)
+        cfg_m2 = sc.load_config()
+        check("null default_monitor coerced to default", cfg_m2["default_monitor"] == "primary")
 finally:
     sc.CONFIG_PATH = orig
 
@@ -922,6 +940,57 @@ check("a RecordArea D-Bus error falls back to RecordMonitor (same session)",
       ["RecordArea", "RecordMonitor"], bus.calls)
 check("...and says so on stderr", "RecordArea failed" in _err.getvalue(),
       _err.getvalue())
+print("multi-monitor discovery & target resolution (deterministic, two fake "
+      "monitors)")
+_two = _FakeBus(_state(
+    [_lm(2560, 0, 1.0, 0, False, "HDMI-1"), _lm(0, 0, 2.0, 0, True, "eDP-1")],
+    [_mon("HDMI-1", 1920, 1080), _mon("eDP-1", 2560, 1600)]))
+_mons = sc._list_monitors(_two)
+check("monitors are indexed left-to-right by layout position, not D-Bus order",
+      [m["connector"] for m in _mons] == ["eDP-1", "HDMI-1"]
+      and [m["index"] for m in _mons] == [0, 1], _mons)
+check("each monitor carries its logical rect and physical mode",
+      _mons[0]["rect"] == (0, 0, 1280, 800) and (_mons[0]["width"],
+      _mons[0]["height"]) == (2560, 1600) and _mons[1]["rect"] == (2560, 0, 1920, 1080),
+      _mons)
+check("display name falls back to the connector", _mons[0]["name"] == "eDP-1")
+_r = lambda t: sc._resolve_target_monitor(_two, t)["connector"]
+check("None / 'primary' / '' -> the primary", {_r(None), _r("primary"), _r(""),
+                                                 _r("PRIMARY")} == {"eDP-1"})
+check("index as int or string", (_r(1), _r("1"), _r(0)) == ("HDMI-1", "HDMI-1", "eDP-1"))
+check("connector name, case-insensitive", (_r("hdmi-1"), _r("EDP-1")) == ("HDMI-1", "eDP-1"))
+check("display-name substring, case-insensitive", _r("hdmi") == "HDMI-1")
+_err = _io.StringIO()
+with _contextlib.redirect_stderr(_err):
+    _fb = (_r("NOPE"), _r("7"), _r("-9"))
+check("unknown target / out-of-range index -> primary, with a stderr notice",
+      _fb == ("eDP-1",) * 3 and _err.getvalue().count("not found") == 3,
+      (_fb, _err.getvalue()))
+check("the D-Bus-derived list agrees with the -l printout",
+      sc._print_monitors(_two) == 0)
+try:
+    sc._list_monitors(_FakeBus(_state([], [])))
+    check("empty monitor list -> CaptureError", False)
+except sc.CaptureError:
+    check("empty monitor list -> CaptureError", True)
+check("-l with DisplayConfig unreachable exits 2",
+      sc._print_monitors(_FakeBus(GLib.Error("simulated"))) == 2)
+
+print("multi-monitor discovery (live)")
+try:
+    monitors = sc._list_monitors()
+    check("monitors discovered", len(monitors) >= 1)
+    check("every monitor has a logical rect", all(m["rect"] for m in monitors), monitors)
+    check("'primary' resolves to the flagged primary",
+          sc._resolve_target_monitor(target="primary")["primary"] is True)
+    check("connector round-trips",
+          sc._resolve_target_monitor(target=monitors[0]["connector"]) is not None)
+    check("the primary's rect matches _primary_monitor()",
+          sc._primary_monitor(_Gio.bus_get_sync(_Gio.BusType.SESSION, None))
+          == (sc._resolve_target_monitor(target="primary")["connector"],
+              sc._resolve_target_monitor(target="primary")["rect"]))
+except sc.CaptureError as exc:
+    check("live monitor discovery", False, str(exc))
 
 # ---------------------------------------------------------------------------
 print("ScreenCast capture (flash-free, primary path)")
