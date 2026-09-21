@@ -8,11 +8,14 @@ people working with AI models alike.
 - **I review PRs when I have time.** If your PR has been sitting without a
   review, that does not mean it has been rejected. If it is good, it will
   land eventually. Feel free to submit and move on.
-- **You will be credited.** Landed work keeps you as the author or a
-  co-author in the git history. If you would rather not be credited, or want
-  a credit removed later, contact me on GitHub and I will take care of it.
+- **Credit goes with landed work only.** If your PR is merged, you stay the
+  author or a co-author in the git history. If it is not merged, for example
+  because it adds a feature this tool does not need, there is nothing to
+  credit and it is simply closed. If you would rather not be credited for
+  merged work, or want a credit removed later, contact me on GitHub.
 - **Rework is normal.** If a PR is close but not quite right, I may land a
-  reworked version rather than send it back and forth. You still get credit.
+  reworked version rather than send it back and forth; you are credited on
+  that commit.
 
 ## What this project is
 
