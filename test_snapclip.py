@@ -792,11 +792,159 @@ finally:
     sc.CONFIG_PATH = orig
 
 # ---------------------------------------------------------------------------
+print("primary monitor geometry (DisplayConfig -> the RecordArea rectangle)")
+
+
+class _FakeBus:
+    """Stands in for Gio.DBusConnection: `reply` is returned from call_sync
+    (an object with .unpack()), or raised if it is an exception; every call
+    is logged as (method, unpacked parameters)."""
+
+    def __init__(self, reply=None, replies=None):
+        self.reply = reply
+        self.replies = dict(replies or {})    # method -> reply or exception
+        self.calls = []
+
+    def call_sync(self, _name, _path, _iface, method, params, *_rest):
+        self.calls.append((method, params.unpack() if params is not None
+                           else None))
+        reply = self.replies.get(method, self.reply)
+        if isinstance(reply, BaseException):
+            raise reply
+        return types.SimpleNamespace(unpack=lambda: reply)
+
+
+def _state(logical, monitors, props=None):
+    # Shape of org.gnome.Mutter.DisplayConfig.GetCurrentState, unpacked.
+    return (1, monitors, logical, {"layout-mode": 1} if props is None else props)
+
+
+def _mon(connector, w, h, current=True):
+    return ((connector, "VEN", "PRD", "SER"),
+            [("%dx%d@60" % (w, h), w, h, 60.0, 1.0, [1.0],
+              {"is-current": True} if current else {})],
+            {})
+
+
+def _lm(x, y, scale, transform, primary, connector):
+    return (x, y, scale, transform, primary, [(connector, "VEN", "PRD", "SER")], {})
+
+
+conn, rect = sc._primary_monitor(_FakeBus(_state(
+    [_lm(0, 0, 1.0, 0, True, "HDMI-1")], [_mon("HDMI-1", 1920, 1080)])))
+check("plain 1080p monitor -> its logical rect",
+      (conn, rect) == ("HDMI-1", (0, 0, 1920, 1080)), (conn, rect))
+
+conn, rect = sc._primary_monitor(_FakeBus(_state(
+    [_lm(0, 0, 1.0, 0, False, "DP-1"), _lm(1920, 0, 1.25, 0, True, "DP-2")],
+    [_mon("DP-1", 1920, 1080), _mon("DP-2", 2560, 1440)])))
+check("the PRIMARY logical monitor is chosen, not the first",
+      conn == "DP-2", conn)
+check("fractional scale: logical size = round(px / scale) at the layout offset",
+      rect == (1920, 0, 2048, 1152), rect)
+
+conn, rect = sc._primary_monitor(_FakeBus(_state(
+    [_lm(0, 0, 2.0, 1, True, "eDP-1")], [_mon("eDP-1", 1920, 1080)])))
+check("rotated output (transform 90) swaps width/height before scaling",
+      rect == (0, 0, 540, 960), rect)
+
+conn, rect = sc._primary_monitor(_FakeBus(_state(
+    [_lm(0, 0, 2.0, 0, True, "eDP-1")], [_mon("eDP-1", 1920, 1080)],
+    props={"layout-mode": 2})))
+check("physical layout mode keeps pixel dimensions",
+      rect == (0, 0, 1920, 1080), rect)
+
+conn, rect = sc._primary_monitor(_FakeBus(_state(
+    [_lm(0, 0, 1.0, 0, True, "HDMI-1")], [_mon("HDMI-1", 1920, 1080,
+                                              current=False)])))
+check("no current mode -> connector still known, rect None (RecordMonitor "
+      "fallback)", (conn, rect) == ("HDMI-1", None), (conn, rect))
+
+conn, rect = sc._primary_monitor(_FakeBus(_state(
+    [_lm(0, 0, 1.0, 0, False, "HDMI-1")], [_mon("HDMI-1", 1920, 1080)])))
+check("no primary flagged -> the first logical monitor",
+      (conn, rect) == ("HDMI-1", (0, 0, 1920, 1080)), (conn, rect))
+
+for label, bus in (("no monitors at all", _FakeBus(_state([], []))),
+                   ("DisplayConfig unreachable",
+                    _FakeBus(GLib.Error("simulated D-Bus failure")))):
+    raised = False
+    try:
+        sc._primary_monitor(bus)
+    except sc.CaptureError:
+        raised = True
+    check(f"{label} -> CaptureError", raised)
+
+_gdk_display = Gdk.Display.get_default()
+if _gdk_display is not None:
+    from gi.repository import Gio as _Gio
+    conn, rect = sc._primary_monitor(_Gio.bus_get_sync(_Gio.BusType.SESSION, None))
+    _mons = _gdk_display.get_monitors()
+    _geo = None
+    for _i in range(_mons.get_n_items()):
+        _m = _mons.get_item(_i)
+        if _m.get_connector() == conn:
+            _g = _m.get_geometry()
+            _geo = (_g.x, _g.y, _g.width, _g.height)
+    check("live: the derived rect equals GDK's geometry for that monitor "
+          "(the overlay and the capture agree on the logical size)",
+          _geo is not None and rect == _geo, f"derived={rect} gdk={_geo}")
+else:
+    skip("live rect vs GDK geometry", "no GDK display")
+
+print("stream selection: RecordArea first (works over fullscreen/direct-scanout "
+      "apps), RecordMonitor as the fallback")
+bus = _FakeBus(reply=("/stream/1",))
+path = sc._record_primary(bus, "/session/1", "HDMI-1", (0, 0, 1920, 1080))
+check("with a rect the monitor is recorded as an AREA stream",
+      path == "/stream/1" and [c[0] for c in bus.calls] == ["RecordArea"],
+      bus.calls)
+check("RecordArea gets the logical rect and a hidden cursor",
+      bus.calls and bus.calls[0][1] == (0, 0, 1920, 1080, {"cursor-mode": 0}),
+      bus.calls)
+
+bus = _FakeBus(reply=("/stream/2",))
+path = sc._record_primary(bus, "/session/1", "HDMI-1", None)
+check("without a rect it records the monitor by connector",
+      path == "/stream/2" and bus.calls == [("RecordMonitor",
+                                             ("HDMI-1", {"cursor-mode": 0}))],
+      bus.calls)
+
+bus = _FakeBus(reply=("/stream/3",),
+               replies={"RecordArea": GLib.Error("simulated: no RecordArea")})
+import io as _io
+import contextlib as _contextlib
+_err = _io.StringIO()
+with _contextlib.redirect_stderr(_err):
+    path = sc._record_primary(bus, "/session/1", "HDMI-1", (0, 0, 1920, 1080))
+check("a RecordArea D-Bus error falls back to RecordMonitor (same session)",
+      path == "/stream/3" and [c[0] for c in bus.calls] ==
+      ["RecordArea", "RecordMonitor"], bus.calls)
+check("...and says so on stderr", "RecordArea failed" in _err.getvalue(),
+      _err.getvalue())
+
+# ---------------------------------------------------------------------------
 print("ScreenCast capture (flash-free, primary path)")
 pics_before = set(os.listdir(PICTURES)) if os.path.isdir(PICTURES) else set()
+_orig_record = sc._record_primary
+_record_seen = {}
+
+
+def _spy_record(bus, session, connector, rect):
+    _record_seen["rect"] = rect
+    return _orig_record(bus, session, connector, rect)
+
+
+sc._record_primary = _spy_record
+_err = _io.StringIO()
 try:
-    sc_surf, sc_conn = sc.screencast_capture()
+    with _contextlib.redirect_stderr(_err):
+        sc_surf, sc_conn = sc.screencast_capture()
     check("screencast returned a surface", isinstance(sc_surf, cairo.ImageSurface))
+    check("live capture went through RecordArea (rect known, no fallback)",
+          _record_seen.get("rect") is not None
+          and "RecordArea failed" not in _err.getvalue(),
+          f"rect={_record_seen.get('rect')} stderr={_err.getvalue()!r}")
     check("screencast reports the captured connector",
           isinstance(sc_conn, str) and bool(sc_conn), sc_conn)
     check("screencast surface has sane dimensions",
@@ -807,6 +955,8 @@ try:
           pics_after == pics_before, f"new: {pics_after - pics_before}")
 except sc.CaptureError as exc:
     check("screencast capture", False, f"CaptureError: {exc}")
+finally:
+    sc._record_primary = _orig_record
 
 print("capture_screen() prefers flash-free ScreenCast")
 try:

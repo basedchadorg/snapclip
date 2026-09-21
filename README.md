@@ -60,6 +60,9 @@ the crop to the clipboard, and exits — with no flash at any point.
 - ✅ Move / resize / rubber-band a new box; **double-click** to grab the whole monitor.
 - ✅ **No capture flash, no toolbar clutter, no leftover temp files.**
 - ✅ Correct under **fractional scaling** and **multi-monitor**.
+- ✅ **Works over fullscreen apps and games** (Minecraft, fullscreen video):
+  the capture does not depend on the compositor repainting, and the
+  overlay opens on top with focus.
 - ✅ Settings (border, dim, save folder, …) + a hotkey-friendly single command.
 - ✅ **Optional tools, all off by default** so the toolbar stays just
   Copy / Save / Cancel: polygon & freehand selection (transparent outside the
@@ -185,6 +188,15 @@ apply live and are written once when the dialog closes.
    Cairo surface (≈0.2 s, no flash, no file on disk). If ScreenCast is unavailable
    it refuses to capture (rather than silently flashing) unless you pass
    `--allow-flash`, which uses the portal and deletes its PNG dump.
+   The monitor is recorded as an **area stream** of its logical rectangle
+   (`RecordArea`) rather than a monitor stream (`RecordMonitor`): a monitor
+   stream only produces a frame when the compositor next paints that monitor,
+   and while a fullscreen game holds the display on **direct scanout** the
+   compositor is not painting at all, so no frame ever comes. An area stream
+   paints the scene into the PipeWire buffer on demand the moment it starts
+   (~20 ms over a fullscreen Minecraft, where a monitor stream delivered
+   nothing in 10 s). `RecordMonitor` remains the fallback if the area call is
+   refused.
 2. **Frozen full-screen overlay.** That capture is shown frozen inside a single
    undecorated, full-screen GTK4 window. The selection rectangle is drawn *as
    graphics inside that fixed surface* — the window is never moved, which sidesteps
@@ -255,6 +267,17 @@ implement but **GNOME's Mutter does not**. `scrot` is X11-only. On GNOME Wayland
 supported capture paths are the GNOME Shell screenshot D-Bus interface (now
 `AccessDenied` to normal apps), the XDG screenshot portal (which flashes), or — what
 snapclip uses — Mutter ScreenCast over PipeWire (no flash).
+
+### Does it work over fullscreen games and videos?
+Yes. Fullscreen windows on GNOME are usually put on **direct scanout** (their
+buffers go straight to the display, bypassing the compositor). A plain
+ScreenCast *monitor* stream waits for the compositor to paint, which never
+happens in that state, so tools built on it hang or come back with a stale
+frame. snapclip records the monitor's *area* instead, which paints the scene
+on demand, so the overlay appears immediately on top of the game with the
+current frame frozen behind it. Games that grab the keyboard outright
+(Wayland shortcut inhibition) will keep the hotkey for themselves, as they do
+for every GNOME shortcut.
 
 ### Does snapclip put the screenshot in the clipboard or save a file?
 **Enter copies to the clipboard only** (`image/png`) and writes nothing to disk.

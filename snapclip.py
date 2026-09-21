@@ -5,7 +5,10 @@ snapclip — a minimal region-screenshot tool for Ubuntu / GNOME / Wayland.
 Architecture (why it works on GNOME 50 Wayland, and why it is fast):
 
   * The screen is captured ONCE at launch, flash-free, by grabbing a single
-    frame from Mutter's ScreenCast interface over PipeWire.  (On GNOME 50 the
+    frame from Mutter's ScreenCast interface over PipeWire — as an AREA
+    stream of the primary monitor's rectangle, which paints on demand and so
+    works over fullscreen games on direct scanout, where a monitor stream
+    never delivers a first frame (see _record_primary).  (On GNOME 50 the
     older org.gnome.Shell.Screenshot D-Bus interface returns "AccessDenied",
     grim fails because Mutter has no wlr-screencopy, and the screenshot portal
     plays GNOME's shutter flash — it is only used with --allow-flash.)
@@ -339,24 +342,101 @@ def portal_capture(timeout_s=30):
     return surface
 
 
-def _primary_connector(bus):
-    """Connector name (e.g. 'HDMI-1') of the primary monitor, via Mutter."""
+def _primary_monitor(bus):
+    """(connector, rect) of the primary monitor, via Mutter's DisplayConfig.
+
+    `connector` is e.g. 'HDMI-1'; `rect` is that monitor's (x, y, w, h) in
+    the compositor's logical layout — the coordinates ScreenCast.RecordArea
+    takes — or None when it cannot be derived (then the caller falls back
+    to RecordMonitor, which only needs the connector).  Mutter derives the
+    logical size the same way: the current mode in pixels, swapped when the
+    output is rotated, divided by the scale in the default (logical) layout
+    mode, and used as-is in the physical layout mode.
+    """
     try:
         r = bus.call_sync(
             "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
             "org.gnome.Mutter.DisplayConfig", "GetCurrentState",
             None, None, Gio.DBusCallFlags.NONE, -1, None,
         )
-        _serial, _monitors, logical, _props = r.unpack()
-        for lm in logical:
-            # lm = (x, y, scale, transform, primary, [(connector, ...)], props)
-            if lm[4] and lm[5]:
-                return lm[5][0][0]
-        if logical and logical[0][5]:
-            return logical[0][5][0][0]
+        _serial, monitors, logical, props = r.unpack()
+        lm = None
+        for cand in logical:
+            # cand = (x, y, scale, transform, primary, [(connector, ...)], props)
+            if cand[4] and cand[5]:
+                lm = cand
+                break
+        if lm is None and logical and logical[0][5]:
+            lm = logical[0]
+        if lm is None:
+            raise CaptureError("no monitor reported by Mutter")
+        x, y, scale, transform = lm[0], lm[1], float(lm[2]), int(lm[3])
+        connector = lm[5][0][0]
     except (GLib.Error, IndexError, ValueError, TypeError) as exc:
         raise CaptureError(f"could not determine the primary monitor: {exc}")
-    raise CaptureError("no monitor reported by Mutter")
+
+    rect = None
+    try:
+        for spec, modes, _mprops in monitors:
+            if spec[0] != connector:
+                continue
+            for mode in modes:
+                # mode = (id, width, height, refresh, preferred_scale,
+                #         supported_scales, props)
+                if mode[6].get("is-current"):
+                    w, h = int(mode[1]), int(mode[2])
+                    if transform & 1:               # 90 / 270 degree rotations
+                        w, h = h, w
+                    if props.get("layout-mode", 1) == 1 and scale > 0:
+                        w = int(round(w / scale))
+                        h = int(round(h / scale))
+                    if w > 0 and h > 0:
+                        rect = (int(x), int(y), w, h)
+                    break
+            break
+    except (IndexError, ValueError, TypeError, AttributeError):
+        rect = None
+    return connector, rect
+
+
+def _record_primary(bus, session, connector, rect):
+    """Add the primary monitor's stream to a ScreenCast session; returns the
+    stream object path.
+
+    RecordArea (the monitor's logical rectangle) is preferred over
+    RecordMonitor because of how Mutter produces the FIRST frame.  A monitor
+    stream only records when the compositor next paints that monitor.  With a
+    fullscreen window on direct scanout (a game such as Minecraft, a
+    fullscreen video) the compositor is not painting at all — the client's
+    buffers go straight to the display — so nothing arrives until something
+    else damages the screen, and snapclip would wait out its timeout (or,
+    if the user moved in the game meanwhile, show a stale frame late).  An
+    area stream instead paints the stage into the PipeWire buffer on demand
+    the moment the stream starts, scanout or not: measured ~20 ms to the
+    first frame over a fullscreen Minecraft where RecordMonitor delivered
+    nothing in 10 s.  Its buffer is the same size as the monitor stream's
+    (logical size x the monitor's scale, so fractional scaling is unchanged).
+    """
+    props = {"cursor-mode": GLib.Variant("u", 0)}       # hidden
+    if rect is not None:
+        try:
+            r = bus.call_sync(
+                "org.gnome.Mutter.ScreenCast", session,
+                "org.gnome.Mutter.ScreenCast.Session", "RecordArea",
+                GLib.Variant("(iiiia{sv})", (*rect, props)),
+                None, Gio.DBusCallFlags.NONE, -1, None,
+            )
+            return r.unpack()[0]
+        except GLib.Error as exc:
+            print(f"snapclip: RecordArea failed ({exc}); using RecordMonitor",
+                  file=sys.stderr)
+    r = bus.call_sync(
+        "org.gnome.Mutter.ScreenCast", session,
+        "org.gnome.Mutter.ScreenCast.Session", "RecordMonitor",
+        GLib.Variant("(sa{sv})", (connector, props)),
+        None, Gio.DBusCallFlags.NONE, -1, None,
+    )
+    return r.unpack()[0]
 
 
 def _sample_to_surface(sample):
@@ -431,6 +511,9 @@ def texture_for_surface(surface):
 def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
     """Grab one frame of the primary monitor via Mutter ScreenCast + PipeWire.
 
+    The monitor is recorded as an AREA stream of its logical rectangle (see
+    _record_primary for why: a monitor stream yields no frame while a
+    fullscreen game holds the display on direct scanout).
     Returns (surface, connector): a cairo.ImageSurface (physical pixels of that
     monitor) and the connector name that was captured (e.g. 'HDMI-1'), so the
     overlay can be placed on the same monitor.  Two optional hooks let a caller
@@ -447,7 +530,7 @@ def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
     except GLib.Error as exc:
         raise CaptureError(f"cannot reach the session bus: {exc}")
 
-    connector = _primary_connector(bus)
+    connector, rect = _primary_monitor(bus)
     if on_connector is not None:
         on_connector(connector)
     session = None
@@ -462,14 +545,7 @@ def screencast_capture(timeout_s=10, on_connector=None, on_frame=None):
                 None, Gio.DBusCallFlags.NONE, -1, None,
             )
             session = r.unpack()[0]
-            r = bus.call_sync(
-                "org.gnome.Mutter.ScreenCast", session,
-                "org.gnome.Mutter.ScreenCast.Session", "RecordMonitor",
-                GLib.Variant("(sa{sv})",
-                             (connector, {"cursor-mode": GLib.Variant("u", 0)})),
-                None, Gio.DBusCallFlags.NONE, -1, None,
-            )
-            stream = r.unpack()[0]
+            stream = _record_primary(bus, session, connector, rect)
         except GLib.Error as exc:
             raise CaptureError(f"Mutter ScreenCast setup failed: {exc}")
 
@@ -2927,7 +3003,7 @@ def quick_save(surface, config):
 # ----------------------------------------------------------------------------
 
 
-VERSION = "snapclip 1.3"
+VERSION = "snapclip 1.4"
 
 
 def _which(cmd):

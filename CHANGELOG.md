@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.4 — 2026-09-21
+
+### Fixed
+- **Fullscreen applications.** Over a fullscreen game or video (Minecraft
+  was the report) snapclip either sat for its 10 s capture timeout and
+  errored, or — if the game repainted in the meantime — showed up late with
+  that later frame. Mutter puts fullscreen windows on direct scanout, so
+  the compositor stops painting the monitor; the `RecordMonitor` ScreenCast
+  stream only records on a compositor paint and therefore never delivered
+  its first frame. The primary monitor is now captured as a `RecordArea`
+  stream of its logical rectangle, which paints the scene into the PipeWire
+  buffer on demand: ~20 ms to the first frame over a fullscreen Minecraft.
+  The buffer is the same size as before (logical size × the monitor's scale),
+  so fractional scaling, rotation and multi-monitor layouts are unchanged;
+  `RecordMonitor` stays as the fallback if the area call is refused. Verified
+  live over Minecraft: the overlay maps on top, focused, with the current
+  game frame frozen behind it, both from a shell and through the same
+  launch path gnome-settings-daemon uses for custom shortcuts.
+- The primary monitor's logical rectangle is derived from Mutter's
+  `DisplayConfig` exactly as Mutter does (current mode, swapped for 90°/270°
+  rotations, divided by the scale in the logical layout mode), and the test
+  suite checks it against GDK's geometry live.
+
 ## 1.3 — 2026-09-11
 
 ### Added
